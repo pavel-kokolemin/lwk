@@ -27,6 +27,7 @@ pub struct TxBuilder {
     addressees: Vec<Recipient>,
     fee_rate: f32,
     issuance_request: IssuanceRequest,
+    blind: bool,
 }
 
 impl TxBuilder {
@@ -36,6 +37,7 @@ impl TxBuilder {
             addressees: vec![],
             fee_rate: 100.0,
             issuance_request: IssuanceRequest::None,
+            blind: true,
         }
     }
 
@@ -91,6 +93,11 @@ impl TxBuilder {
         if let Some(fee_rate) = fee_rate {
             self.fee_rate = fee_rate
         }
+        self
+    }
+
+    pub fn blind(mut self, blind: bool) -> Self {
+        self.blind = blind;
         self
     }
 
@@ -356,11 +363,13 @@ impl TxBuilder {
         // TODO inputs/outputs(except fee) randomization, not trivial because of blinder_index on inputs
 
         // Blind the transaction
-        let mut rng = thread_rng();
-        pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
+        if self.blind {
+            let mut rng = thread_rng();
+            pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
 
-        // Add details to the pset from our descriptor, like bip32derivation and keyorigin
-        wollet.add_details(&mut pset)?;
+            // Add details to the pset from our descriptor, like bip32derivation and keyorigin
+            wollet.add_details(&mut pset)?;
+        }
 
         Ok(pset)
     }
