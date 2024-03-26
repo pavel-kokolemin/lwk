@@ -2,6 +2,7 @@ use crate::{Error, Script};
 use lwk_wollet::elements;
 use wasm_bindgen::prelude::*;
 
+/// Wrapper of [`elements::Address`]
 #[wasm_bindgen]
 pub struct Address {
     inner: elements::Address,
@@ -18,6 +19,12 @@ impl From<&elements::Address> for Address {
         Self {
             inner: inner.clone(),
         }
+    }
+}
+
+impl From<Address> for elements::Address {
+    fn from(addr: Address) -> Self {
+        addr.inner
     }
 }
 
@@ -63,6 +70,7 @@ impl Address {
     }
 }
 
+/// Wrapper of [`lwk_wollet::AddressResult`]
 #[wasm_bindgen]
 pub struct AddressResult {
     inner: lwk_wollet::AddressResult,

@@ -19,12 +19,10 @@ use elements_miniscript::{DescriptorPublicKey, ForEachKey};
 use lwk_common::Signer;
 use lwk_jade::register_multisig::{JadeDescriptor, RegisterMultisigParams};
 use lwk_signer::*;
-use lwk_wollet::ElectrumClient;
 use lwk_wollet::*;
 use pulldown_cmark::{CodeBlockKind, Event, Tag};
 use rand::{thread_rng, Rng};
 use serde_json::Value;
-use std::convert::TryInto;
 use std::env;
 use std::str::FromStr;
 use std::sync::Once;
@@ -335,6 +333,10 @@ impl TestWollet {
         }
     }
 
+    pub fn tx_builder(&self) -> WolletTxBuilder {
+        self.wollet.tx_builder()
+    }
+
     pub fn db_root_dir(self) -> TempDir {
         self.db_root_dir
     }
@@ -450,8 +452,11 @@ impl TestWollet {
         let recipient = external.clone().unwrap_or((self.address(), 10_000));
 
         let mut pset = self
-            .wollet
-            .send_lbtc(recipient.1, &recipient.0.to_string(), fee_rate)
+            .tx_builder()
+            .add_lbtc_recipient(&recipient.0, recipient.1)
+            .unwrap()
+            .fee_rate(fee_rate)
+            .finish()
             .unwrap();
         pset = pset_rt(&pset);
 
@@ -497,21 +502,20 @@ impl TestWollet {
     pub fn send_asset(
         &mut self,
         signers: &[&AnySigner],
-        node_address: &Address,
+        address: &Address,
         asset: &AssetId,
         fee_rate: Option<f32>,
     ) {
         let balance_before = self.balance(asset);
         let satoshi: u64 = 10;
         let mut pset = self
-            .wollet
-            .send_asset(
-                satoshi,
-                &node_address.to_string(),
-                &asset.to_string(),
-                fee_rate,
-            )
+            .tx_builder()
+            .add_recipient(address, satoshi, *asset)
+            .unwrap()
+            .fee_rate(fee_rate)
+            .finish()
             .unwrap();
+
         pset = pset_rt(&pset);
 
         let details = self.wollet.get_details(&pset).unwrap();
@@ -564,7 +568,15 @@ impl TestWollet {
                 asset: ass2,
             },
         ];
-        let mut pset = self.wollet.send_many(addressees, fee_rate).unwrap();
+
+        let mut pset = self
+            .tx_builder()
+            .set_unvalidated_recipients(&addressees)
+            .unwrap()
+            .fee_rate(fee_rate)
+            .finish()
+            .unwrap();
+
         pset = pset_rt(&pset);
 
         let details = self.wollet.get_details(&pset).unwrap();
@@ -592,13 +604,21 @@ impl TestWollet {
         signers: &[&AnySigner],
         satoshi_asset: u64,
         satoshi_token: u64,
-        contract: &str,
+        contract: Option<&str>,
         fee_rate: Option<f32>,
     ) -> (AssetId, AssetId) {
         let balance_before = self.balance_btc();
+        let contract = contract.map(|c| Contract::from_str(c).unwrap());
+        let contract_hash = contract
+            .as_ref()
+            .map(|c| c.contract_hash().unwrap())
+            .unwrap_or_else(|| ContractHash::from_slice(&[0u8; 32]).expect("static"));
         let mut pset = self
-            .wollet
-            .issue_asset(satoshi_asset, "", satoshi_token, "", contract, fee_rate)
+            .tx_builder()
+            .issue_asset(satoshi_asset, None, satoshi_token, None, contract)
+            .unwrap()
+            .fee_rate(fee_rate)
+            .finish()
             .unwrap();
         pset = pset_rt(&pset);
 
@@ -651,11 +671,6 @@ impl TestWollet {
             issuance_input.previous_txid,
             issuance_input.previous_output_index,
         );
-        let contract_hash = if contract.is_empty() {
-            ContractHash::from_slice(&[0u8; 32]).unwrap()
-        } else {
-            ContractHash::from_json_contract(contract).unwrap()
-        };
         assert_eq!(asset, AssetId::new_issuance(prevout, contract_hash));
 
         (asset, token)
@@ -673,8 +688,11 @@ impl TestWollet {
         let balance_asset_before = self.balance(asset);
         let balance_token_before = self.balance(&issuance.token);
         let mut pset = self
-            .wollet
-            .reissue_asset(asset.to_string().as_str(), satoshi_asset, "", fee_rate)
+            .tx_builder()
+            .reissue_asset(*asset, satoshi_asset, None)
+            .unwrap()
+            .fee_rate(fee_rate)
+            .finish()
             .unwrap();
         pset = pset_rt(&pset);
 
@@ -735,8 +753,11 @@ impl TestWollet {
         let balance_btc_before = self.balance_btc();
         let balance_asset_before = self.balance(asset);
         let mut pset = self
-            .wollet
-            .burn_asset(&asset.to_string(), satoshi_asset, fee_rate)
+            .tx_builder()
+            .add_burn(satoshi_asset, *asset)
+            .unwrap()
+            .fee_rate(fee_rate)
+            .finish()
             .unwrap();
         pset = pset_rt(&pset);
 
@@ -801,6 +822,10 @@ impl TestWollet {
             assert_eq!(expected, balance);
             assert_eq!(expected_updates, wollet.updates().unwrap());
         }
+    }
+
+    pub fn network(&self) -> ElementsNetwork {
+        self.wollet.network()
     }
 }
 

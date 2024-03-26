@@ -4,10 +4,29 @@ use elements::hashes::hex::FromHex;
 
 use crate::LwkError;
 
+/// Wrapper over [`lwk_wollet::Contract`]
 #[derive(uniffi::Object)]
 #[uniffi::export(Display)]
 pub struct Contract {
     inner: lwk_wollet::Contract,
+}
+
+impl From<lwk_wollet::Contract> for Contract {
+    fn from(inner: lwk_wollet::Contract) -> Self {
+        Self { inner }
+    }
+}
+
+impl From<Contract> for lwk_wollet::Contract {
+    fn from(contract: Contract) -> Self {
+        contract.inner
+    }
+}
+
+impl From<&Contract> for lwk_wollet::Contract {
+    fn from(contract: &Contract) -> Self {
+        contract.inner.clone()
+    }
 }
 
 impl std::fmt::Display for Contract {

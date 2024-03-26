@@ -3,8 +3,9 @@ use std::fmt::Display;
 use lwk_wollet::UnvalidatedRecipient;
 use wasm_bindgen::prelude::*;
 
-use crate::{Address, AssetId, Error, Network, Pset, Wollet};
+use crate::{Address, AssetId, Contract, Error, Network, Pset, Wollet};
 
+/// Wrapper of [`lwk_wollet::TxBuilder`]
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct TxBuilder {
@@ -88,6 +89,46 @@ impl TxBuilder {
             .into()
     }
 
+    /// Issue an asset, wrapper of [`lwk_wollet::TxBuilder::issue_asset()`]
+    #[wasm_bindgen(js_name = issueAsset)]
+    pub fn issue_asset(
+        self,
+        asset_sats: u64,
+        asset_receiver: Option<Address>,
+        token_sats: u64,
+        token_receiver: Option<Address>,
+        contract: Option<Contract>,
+    ) -> Result<TxBuilder, Error> {
+        Ok(self
+            .inner
+            .issue_asset(
+                asset_sats,
+                asset_receiver.map(Into::into),
+                token_sats,
+                token_receiver.map(Into::into),
+                contract.map(Into::into),
+            )?
+            .into())
+    }
+
+    /// Reissue an asset, wrapper of [`lwk_wollet::TxBuilder::reissue_asset()`]
+    #[wasm_bindgen(js_name = reissueAsset)]
+    pub fn reissue_asset(
+        self,
+        asset_to_reissue: AssetId,
+        satoshi_to_reissue: u64,
+        asset_receiver: Option<Address>,
+    ) -> Result<TxBuilder, Error> {
+        Ok(self
+            .inner
+            .reissue_asset(
+                asset_to_reissue.into(),
+                satoshi_to_reissue,
+                asset_receiver.map(Into::into),
+            )?
+            .into())
+    }
+
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         self.to_string()
@@ -116,12 +157,12 @@ mod tests {
         let policy = network.policy_asset();
 
         let mut builder = TxBuilder::new(network);
-        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, addressees: [], fee_rate: 100.0, issuance_request: None }");
+        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [], fee_rate: 100.0, issuance_request: None }");
 
         builder = builder.fee_rate(Some(200.0));
-        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, addressees: [], fee_rate: 200.0, issuance_request: None }");
+        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [], fee_rate: 200.0, issuance_request: None }");
 
         builder = builder.add_burn(1000, &policy);
-        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, addressees: [Recipient { satoshi: 1000, script_pubkey: Script(OP_RETURN OP_0), blinding_pubkey: None, asset: 6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d }], fee_rate: 200.0, issuance_request: None }");
+        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [Recipient { satoshi: 1000, script_pubkey: Script(OP_RETURN), blinding_pubkey: None, asset: 6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d }], fee_rate: 200.0, issuance_request: None }");
     }
 }

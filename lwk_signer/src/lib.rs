@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-//! Contains a software signer [`SwSigner`] and an [`AnySigner`] that can be a Jade or a Software signer
+//! Contains a software signer [`SwSigner`] and an [`AnySigner`] that can be a Jade or a Software signer.
+//!
+//! Signers should implement [`lwk_common::Signer`]
 
 mod software;
 
@@ -9,11 +11,11 @@ pub use crate::software::{NewError, SignError, SwSigner};
 pub use bip39;
 
 use elements_miniscript::bitcoin::bip32::DerivationPath;
-use elements_miniscript::elements;
 use elements_miniscript::elements::bitcoin::bip32::Xpub;
 use elements_miniscript::elements::pset::PartiallySignedTransaction;
 use lwk_common::Signer;
 
+/// Possible errors when signing with [`AnySigner`]
 #[derive(thiserror::Error, Debug)]
 pub enum SignerError {
     #[error(transparent)]
@@ -27,6 +29,7 @@ pub enum SignerError {
     Bip32Error(#[from] elements::bitcoin::bip32::Error),
 }
 
+/// A signer that can be a software signer [`SwSigner`] or a [`lwk_jade::Jade`]
 #[derive(Debug)]
 pub enum AnySigner {
     Software(SwSigner),

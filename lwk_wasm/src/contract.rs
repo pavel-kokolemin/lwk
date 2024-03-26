@@ -2,9 +2,22 @@ use crate::Error;
 use lwk_wollet::hashes::hex::FromHex;
 use wasm_bindgen::prelude::*;
 
+/// Wrapper of [`lwk_wollet::Contract`]
 #[wasm_bindgen]
 pub struct Contract {
     inner: lwk_wollet::Contract,
+}
+
+impl From<Contract> for lwk_wollet::Contract {
+    fn from(value: Contract) -> Self {
+        value.inner
+    }
+}
+
+impl From<lwk_wollet::Contract> for Contract {
+    fn from(inner: lwk_wollet::Contract) -> Self {
+        Self { inner }
+    }
 }
 
 impl std::fmt::Display for Contract {

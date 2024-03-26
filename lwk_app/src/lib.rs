@@ -479,13 +479,18 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let r: request::Send = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let wollet: &mut Wollet = s.wollets.get_mut(&r.name)?;
-            let mut tx = wollet.send_many(
-                r.addressees
-                    .into_iter()
-                    .map(unvalidated_addressee)
-                    .collect(),
-                r.fee_rate,
-            )?;
+
+            let recipients: Vec<_> = r
+                .addressees
+                .into_iter()
+                .map(unvalidated_addressee)
+                .collect();
+            let mut tx = wollet
+                .tx_builder()
+                .set_unvalidated_recipients(&recipients)?
+                .fee_rate(r.fee_rate)
+                .finish()?;
+
             add_contracts(&mut tx, s.assets.iter());
             Response::result(
                 request.id,
@@ -631,6 +636,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let mut s = state.lock()?;
             let wollet = s.wollets.get_mut(&r.name)?;
 
+            let descriptor = wollet.descriptor().to_string();
             let type_ = match wollet.descriptor().descriptor.desc_type() {
                 DescriptorType::Wpkh => response::WalletType::Wpkh,
                 DescriptorType::ShWpkh => response::WalletType::ShWpkh,
@@ -673,6 +679,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             Response::result(
                 request.id,
                 serde_json::to_value(response::WalletDetails {
+                    descriptor,
                     type_: type_.to_string(),
                     signers,
                     warnings: warnings.join(", "),
@@ -829,14 +836,19 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let r: request::Issue = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let wollet = s.wollets.get_mut(&r.name)?;
-            let tx = wollet.issue_asset(
-                r.satoshi_asset,
-                r.address_asset.as_deref().unwrap_or(""),
-                r.satoshi_token,
-                r.address_token.as_deref().unwrap_or(""),
-                r.contract.as_deref().unwrap_or(""),
-                r.fee_rate,
-            )?;
+            let tx = wollet
+                .tx_builder()
+                .issue_asset(
+                    r.satoshi_asset,
+                    r.address_asset.map(|a| Address::from_str(&a)).transpose()?,
+                    r.satoshi_token,
+                    r.address_token.map(|a| Address::from_str(&a)).transpose()?,
+                    r.contract
+                        .map(|c| lwk_wollet::Contract::from_str(&c))
+                        .transpose()?,
+                )?
+                .fee_rate(r.fee_rate)
+                .finish()?;
             Response::result(
                 request.id,
                 serde_json::to_value(response::Pset {
@@ -849,12 +861,16 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let mut s = state.lock()?;
             let wollet = s.wollets.get_mut(&r.name)?;
 
-            let mut pset = wollet.reissue_asset(
-                &r.asset,
-                r.satoshi_asset,
-                r.address_asset.as_deref().unwrap_or(""),
-                r.fee_rate,
-            )?;
+            let mut pset = wollet
+                .tx_builder()
+                .reissue_asset(
+                    AssetId::from_str(&r.asset)?,
+                    r.satoshi_asset,
+                    r.address_asset.map(|a| Address::from_str(&a)).transpose()?,
+                )?
+                .fee_rate(r.fee_rate)
+                .finish()?;
+
             add_contracts(&mut pset, s.assets.iter());
             Response::result(
                 request.id,

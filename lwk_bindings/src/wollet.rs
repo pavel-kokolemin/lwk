@@ -3,16 +3,14 @@ use lwk_wollet::NoPersist;
 use crate::desc::WolletDescriptor;
 use crate::network::Network;
 use crate::types::AssetId;
-use crate::{
-    Address, AddressResult, Contract, ForeignPersisterLink, LwkError, Pset, Txid, Update, WalletTx,
-};
+use crate::{AddressResult, ForeignPersisterLink, LwkError, Pset, Txid, Update, WalletTx};
 use std::sync::{MutexGuard, PoisonError};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
-/// A Watch-Only wallet
+/// A Watch-Only wallet, wrapper over [`lwk_wollet::Wollet`]
 #[derive(uniffi::Object)]
 pub struct Wollet {
     inner: Mutex<lwk_wollet::Wollet>, // every exposed method must take `&self` (no &mut) so that we need to encapsulate into Mutex
@@ -100,55 +98,6 @@ impl Wollet {
             .map(Into::into)
             .map(Arc::new)
             .collect())
-    }
-
-    pub fn send_lbtc(
-        &self,
-        satoshis: u64,
-        out_address: &Address,
-        fee_rate: f32,
-    ) -> Result<Arc<Pset>, LwkError> {
-        let wollet = self.inner.lock()?;
-        let pset = wollet.send_lbtc(satoshis, &out_address.to_string(), Some(fee_rate))?;
-        Ok(Arc::new(pset.into()))
-    }
-
-    pub fn send_asset(
-        &self,
-        satoshis: u64,
-        out_address: &Address,
-        asset: &AssetId,
-        fee_rate: f32,
-    ) -> Result<Arc<Pset>, LwkError> {
-        let wollet = self.inner.lock()?;
-        let pset = wollet.send_asset(
-            satoshis,
-            &out_address.to_string(),
-            &asset.to_string(),
-            Some(fee_rate),
-        )?;
-        Ok(Arc::new(pset.into()))
-    }
-
-    pub fn issue_asset(
-        &self,
-        satoshi_asset: u64,
-        address_asset: &Address,
-        satoshi_token: u64,
-        address_token: &Address,
-        contract: &Contract,
-        fee_rate: f32,
-    ) -> Result<Arc<Pset>, LwkError> {
-        let wollet = self.inner.lock()?;
-        let pset = wollet.issue_asset(
-            satoshi_asset,
-            &address_asset.to_string(),
-            satoshi_token,
-            &address_token.to_string(),
-            &contract.to_string(),
-            Some(fee_rate),
-        )?;
-        Ok(Arc::new(pset.into()))
     }
 
     pub fn finalize(&self, pset: &Pset) -> Result<Arc<Pset>, LwkError> {
