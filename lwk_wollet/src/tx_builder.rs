@@ -508,4 +508,11 @@ impl<'a> WolletTxBuilder<'a> {
             )?,
         })
     }
+
+    pub fn blind(self, blind: bool) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.blind(blind),
+        }
+    }
 }
