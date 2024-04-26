@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lwk_common::Signer;
-use lwk_jade::Jade;
-use lwk_jade::Network;
+use lwk_jade::{Jade, Network};
 use lwk_rpc_model::request;
 use lwk_signer::AnySigner;
+use lwk_signer::SwSigner;
 use lwk_tiny_jrpc::Request;
-use lwk_wollet::bitcoin::bip32::Fingerprint;
+use lwk_wollet::asset_ids;
+use lwk_wollet::bitcoin::bip32::{Fingerprint, Xpub};
 use lwk_wollet::bitcoin::XKeyIdentifier;
+use lwk_wollet::elements::encode::serialize;
+use lwk_wollet::elements::hex::ToHex;
 use lwk_wollet::elements::pset::elip100::AssetMetadata;
-use lwk_wollet::elements::{Address, AssetId, OutPoint, Txid};
+use lwk_wollet::elements::{Address, AssetId, OutPoint, Transaction, Txid};
 use lwk_wollet::Contract;
 use lwk_wollet::Wollet;
 use serde::Serialize;
@@ -23,19 +27,89 @@ use crate::method::Method;
 use crate::Error;
 
 #[derive(Debug)]
-pub enum AppSigner {
+enum AppSignerInner {
     JadeId(XKeyIdentifier, Network),
     AvailableSigner(AnySigner),
     ExternalSigner(Fingerprint),
 }
 
+#[derive(Debug)]
+pub struct AppSigner {
+    inner: AppSignerInner,
+    persist: bool,
+}
+
 impl AppSigner {
-    pub fn fingerprint(&self) -> Result<Fingerprint, Error> {
-        Ok(match self {
-            AppSigner::AvailableSigner(s) => s.fingerprint()?,
-            AppSigner::ExternalSigner(f) => *f,
-            AppSigner::JadeId(id, _) => id_to_fingerprint(id),
+    pub fn new_sw(mnemonic: &str, is_mainnet: bool, persist: bool) -> Result<Self, Error> {
+        let sw = SwSigner::new(mnemonic, is_mainnet)?;
+        let inner = AppSignerInner::AvailableSigner(AnySigner::Software(sw));
+        Ok(AppSigner { inner, persist })
+    }
+
+    pub fn new_jade(
+        id: XKeyIdentifier,
+        emulator: Option<SocketAddr>,
+        network: Network,
+    ) -> Result<Self, Error> {
+        let inner = if let Some(socket) = emulator {
+            // The emulator is meant to be used only in testing, we don't aim to handle connection/disconnection
+            let jade = Jade::from_socket(socket, network)?;
+            AppSignerInner::AvailableSigner(AnySigner::Jade(jade, id))
+        } else {
+            AppSignerInner::JadeId(id, network)
+        };
+        Ok(AppSigner {
+            inner,
+            persist: true,
         })
+    }
+
+    pub fn new_external(fingerprint: Fingerprint) -> Self {
+        AppSigner {
+            inner: AppSignerInner::ExternalSigner(fingerprint),
+            persist: false,
+        }
+    }
+
+    pub fn fingerprint(&self) -> Result<Fingerprint, Error> {
+        Ok(match &self.inner {
+            AppSignerInner::AvailableSigner(s) => s.fingerprint()?,
+            AppSignerInner::ExternalSigner(f) => *f,
+            AppSignerInner::JadeId(id, _) => id_to_fingerprint(id),
+        })
+    }
+
+    pub fn xpub(&self) -> Result<Option<Xpub>, Error> {
+        Ok(match &self.inner {
+            AppSignerInner::AvailableSigner(s) => Some(s.xpub()?),
+            _ => None,
+        })
+    }
+
+    pub fn id(&self) -> Result<Option<XKeyIdentifier>, Error> {
+        Ok(match &self.inner {
+            AppSignerInner::AvailableSigner(s) => Some(s.identifier()?),
+            AppSignerInner::JadeId(id, _) => Some(*id),
+            _ => None,
+        })
+    }
+
+    pub fn mnemonic(&self) -> Option<String> {
+        match &self.inner {
+            AppSignerInner::AvailableSigner(AnySigner::Software(s)) => {
+                s.mnemonic().map(|m| m.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn type_(&self) -> String {
+        match &self.inner {
+            AppSignerInner::ExternalSigner(_) => "external".into(),
+            AppSignerInner::JadeId(_, _) => "jade-id".into(),
+            AppSignerInner::AvailableSigner(AnySigner::Software(_)) => "software".into(),
+            AppSignerInner::AvailableSigner(AnySigner::Jade(_, _)) => "jade".into(),
+        }
     }
 }
 
@@ -45,21 +119,49 @@ pub fn id_to_fingerprint(id: &XKeyIdentifier) -> Fingerprint {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RegistryAssetData {
     asset_id: AssetId,
     token_id: AssetId,
-    issuance_prevout: OutPoint,
-    issuance_is_confidential: bool,
+    issuance_vin: u32,
+    issuance_tx: Transaction,
     contract: Contract,
 }
 
 impl RegistryAssetData {
+    pub fn new(
+        asset_id: AssetId,
+        issuance_tx: Transaction,
+        contract: Contract,
+    ) -> Result<Self, Error> {
+        for (vin, txin) in issuance_tx.input.iter().enumerate() {
+            let (asset_id_txin, token_id) = txin.issuance_ids();
+            if asset_id_txin == asset_id {
+                let (asset_id_contract, token_id_contract) = asset_ids(txin, &contract)?;
+                if asset_id_contract != asset_id || token_id_contract != token_id {
+                    return Err(Error::InvalidContractForAsset(asset_id.to_string()));
+                }
+                return Ok(Self {
+                    asset_id,
+                    token_id,
+                    issuance_vin: vin as u32,
+                    issuance_tx,
+                    contract,
+                });
+            }
+        }
+        Err(Error::InvalidIssuanceTxtForAsset(asset_id.to_string()))
+    }
+
     pub fn contract_str(&self) -> String {
         serde_json::to_string(&self.contract).expect("contract")
     }
+
     pub fn contract(&self) -> &Contract {
         &self.contract
+    }
+
+    pub fn issuance_prevout(&self) -> OutPoint {
+        self.issuance_tx.input[self.issuance_vin as usize].previous_output
     }
 }
 
@@ -95,15 +197,14 @@ impl AppAsset {
         }
     }
 
-    #[allow(dead_code)]
     pub fn asset_metadata(&self) -> Option<AssetMetadata> {
         match self {
             AppAsset::PolicyAsset(_) => None,
             AppAsset::RegistryAsset(d) => {
-                Some(AssetMetadata::new(d.contract_str(), d.issuance_prevout))
+                Some(AssetMetadata::new(d.contract_str(), d.issuance_prevout()))
             }
             AppAsset::ReissuanceToken(d) => {
-                Some(AssetMetadata::new(d.contract_str(), d.issuance_prevout))
+                Some(AssetMetadata::new(d.contract_str(), d.issuance_prevout()))
             }
         }
     }
@@ -113,6 +214,32 @@ impl AppAsset {
             AppAsset::PolicyAsset(asset) => *asset,
             AppAsset::RegistryAsset(d) => d.asset_id,
             AppAsset::ReissuanceToken(d) => d.token_id,
+        }
+    }
+
+    pub fn issuance_tx(&self) -> Option<Transaction> {
+        match self {
+            AppAsset::RegistryAsset(d) => Some(d.issuance_tx.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn request(&self) -> Option<Request> {
+        match self {
+            AppAsset::RegistryAsset(a) => {
+                let params = request::AssetInsert {
+                    asset_id: a.asset_id.to_string(),
+                    contract: a.contract_str(),
+                    issuance_tx: serialize(&a.issuance_tx).to_hex(),
+                };
+                Some(Request {
+                    jsonrpc: "2.0".into(),
+                    id: None,
+                    method: Method::AssetInsert.to_string(),
+                    params: Some(serde_json::to_value(params).expect("derived")),
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -154,7 +281,6 @@ pub struct State {
 }
 
 impl Wollets {
-    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Result<&Wollet, Error> {
         self.0
             .get(name)
@@ -231,19 +357,25 @@ impl Signers {
     ) -> Result<&AnySigner, Error> {
         let app_signer = self.get(name)?;
         tracing::debug!("get_available({}) return {:?}", name, app_signer);
-        let jade = match app_signer {
-            AppSigner::JadeId(id, network) => {
+        let jade = match &app_signer.inner {
+            #[cfg(not(feature = "serial"))]
+            AppSignerInner::JadeId(_, _) => {
+                let _timeout = timeout;
+                return Err(Error::FeatSerialDisabled);
+            }
+            #[cfg(feature = "serial")]
+            AppSignerInner::JadeId(id, network) => {
                 // try to connect JadeId -> AvailableSigner(Jade)
                 // TODO possible errors should be kept
-                Jade::from_serial_matching_id(*network, id, timeout)
-                    .map(|jade| AppSigner::AvailableSigner(AnySigner::Jade(jade, *id)))
+                lwk_jade::Jade::from_serial_matching_id(*network, id, timeout)
+                    .map(|jade| AppSignerInner::AvailableSigner(AnySigner::Jade(jade, *id)))
             }
-            AppSigner::AvailableSigner(AnySigner::Jade(j, id)) => {
+            AppSignerInner::AvailableSigner(AnySigner::Jade(j, id)) => {
                 // verify connection, if fails AvailableSigner(Jade) -> JadeId
                 if j.unlock().is_err() {
                     // TODO if emulator should throw the error instead of becoming JadeId
                     // TODO ensure identifier it's cached
-                    Some(AppSigner::JadeId(*id, j.network()))
+                    Some(AppSignerInner::JadeId(*id, j.network()))
                 } else {
                     None
                 }
@@ -251,17 +383,21 @@ impl Signers {
             _ => None,
         };
 
-        if let Some(signer) = jade {
-            // replace the existing AppSigner::JadeId with AppSigner::AvailableSigner
+        if let Some(inner) = jade {
+            let signer = AppSigner {
+                inner,
+                persist: true,
+            };
+            // replace the existing AppSignerInner::JadeId with AppSignerInner::AvailableSigner
             self.0.insert(name.to_string(), signer);
         }
 
-        match self.get(name)? {
-            AppSigner::AvailableSigner(signer) => Ok(signer),
-            AppSigner::ExternalSigner(_) => Err(Error::Generic(
+        match &self.get(name)?.inner {
+            AppSignerInner::AvailableSigner(signer) => Ok(signer),
+            AppSignerInner::ExternalSigner(_) => Err(Error::Generic(
                 "Invalid operation for external signer".to_string(),
             )),
-            AppSigner::JadeId(_, _) => Err(Error::Generic(
+            AppSignerInner::JadeId(_, _) => Err(Error::Generic(
                 "Invalid operation jade is not connected".to_string(),
             )),
         }
@@ -406,31 +542,16 @@ impl State {
     pub fn insert_asset(
         &mut self,
         asset_id: AssetId,
-        prev_txid: Txid,
-        prev_vout: u32,
+        issuance_tx: Transaction,
         contract: Contract,
-        is_confidential: Option<bool>,
     ) -> Result<(), Error> {
-        let previous_output = OutPoint::new(prev_txid, prev_vout);
-        let is_confidential = is_confidential.unwrap_or(false);
-        let (asset_id_c, token_id) =
-            lwk_wollet::issuance_ids(&contract, previous_output, is_confidential)?;
-        if asset_id != asset_id_c {
-            return Err(Error::InvalidContractForAsset(asset_id.to_string()));
-        }
-        let data = RegistryAssetData {
-            asset_id,
-            token_id,
-            issuance_prevout: previous_output,
-            issuance_is_confidential: is_confidential,
-            contract,
-        };
+        let data = RegistryAssetData::new(asset_id, issuance_tx, contract)?;
         self.assets
             .0
             .insert(asset_id, AppAsset::RegistryAsset(data.clone()));
         self.assets
             .0
-            .insert(token_id, AppAsset::ReissuanceToken(data));
+            .insert(data.token_id, AppAsset::ReissuanceToken(data));
         Ok(())
     }
 
@@ -445,6 +566,10 @@ impl State {
     fn get_asset_from_str(&self, asset: &str) -> Result<&AppAsset, Error> {
         let asset = AssetId::from_str(asset).map_err(|e| Error::Generic(e.to_string()))?;
         self.get_asset(&asset)
+    }
+
+    pub fn get_issuance_tx(&self, asset: &AssetId) -> Option<Transaction> {
+        self.get_asset(asset).ok().and_then(|a| a.issuance_tx())
     }
 
     pub fn replace_id_with_ticker(
@@ -498,14 +623,14 @@ impl State {
 
         // Wollets
         for (n, w) in self.wollets.iter() {
-            let params = request::LoadWallet {
+            let params = request::WalletLoad {
                 descriptor: w.descriptor().to_string(),
                 name: n.to_string(),
             };
             let r = Request {
                 jsonrpc: "2.0".into(),
                 id: None,
-                method: Method::LoadWallet.to_string(),
+                method: Method::WalletLoad.to_string(),
                 params: Some(serde_json::to_value(params)?),
             };
             requests.push(r);
@@ -549,8 +674,8 @@ impl State {
 
         // Signers
         for (n, s) in self.signers.iter() {
-            let (params, method) = match s {
-                AppSigner::JadeId(id, _) => {
+            let (params, method) = match &s.inner {
+                AppSignerInner::JadeId(id, _) => {
                     let params = request::SignerLoadJade {
                         name: n.to_string(),
                         id: id.to_string(),
@@ -558,7 +683,7 @@ impl State {
                     };
                     (serde_json::to_value(params)?, Method::SignerLoadJade)
                 }
-                AppSigner::AvailableSigner(a) => match a {
+                AppSignerInner::AvailableSigner(a) => match a {
                     AnySigner::Software(a) => {
                         let params = request::SignerLoadSoftware {
                             name: n.to_string(),
@@ -566,6 +691,7 @@ impl State {
                                 .mnemonic()
                                 .expect("we only create signers from mnemonic")
                                 .to_string(),
+                            persist: s.persist,
                         };
                         (serde_json::to_value(params)?, Method::SignerLoadSoftware)
                     }
@@ -578,7 +704,7 @@ impl State {
                         (serde_json::to_value(params)?, Method::SignerLoadJade)
                     }
                 },
-                AppSigner::ExternalSigner(f) => {
+                AppSignerInner::ExternalSigner(f) => {
                     let params = request::SignerLoadExternal {
                         name: n.to_string(),
                         fingerprint: f.to_string(),
@@ -598,24 +724,8 @@ impl State {
 
         // Assets
         for (_, a) in self.assets.iter() {
-            match a {
-                AppAsset::RegistryAsset(a) => {
-                    let params = request::AssetInsert {
-                        asset_id: a.asset_id.to_string(),
-                        contract: a.contract_str(),
-                        prev_txid: a.issuance_prevout.txid.to_string(),
-                        prev_vout: a.issuance_prevout.vout,
-                        is_confidential: Some(a.issuance_is_confidential),
-                    };
-                    let r = Request {
-                        jsonrpc: "2.0".into(),
-                        id: None,
-                        method: Method::AssetInsert.to_string(),
-                        params: Some(serde_json::to_value(params)?),
-                    };
-                    requests.push(r);
-                }
-                _ => continue,
+            if let Some(r) = a.request() {
+                requests.push(r);
             }
         }
 

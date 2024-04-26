@@ -1,11 +1,15 @@
 use std::{
     collections::HashSet,
+    fs,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    process::{Child, Command, Stdio},
     str::FromStr,
     thread::JoinHandle,
 };
 
 use clap::{Parser, ValueEnum};
+use elements::encode::serialize;
+use elements::hex::ToHex;
 use elements::{pset::PartiallySignedTransaction, Address};
 use lwk_containers::{testcontainers::clients, JadeEmulator, EMULATOR_PORT};
 use serde_json::Value;
@@ -47,14 +51,75 @@ pub fn sh(command: &str) -> Value {
     sh_result(command).unwrap()
 }
 
-fn setup_cli() -> (JoinHandle<()>, TempDir, String, String, TestElectrumServer) {
-    let server = setup(false);
-    let electrum_url = &server.electrs.electrum_url;
-    let addr = get_available_addr().unwrap();
+fn sh_err(command: &str) -> String {
+    format!("{:?}", sh_result(command).unwrap_err())
+}
+
+struct RegistryProc {
+    child: Child,
+    pub url: String,
+}
+
+impl Drop for RegistryProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+fn setup_cli(
+    with_registry: bool,
+) -> (
+    JoinHandle<()>,
+    TempDir,
+    String,
+    String,
+    TestElectrumServer,
+    Option<RegistryProc>,
+) {
+    let server = setup(true);
     let tmp = tempfile::tempdir().unwrap();
     let datadir = tmp.path().display().to_string();
+
+    let stderr = if std::env::var_os("RUST_LOG").is_some() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+
+    let child = if with_registry {
+        let addr = get_available_addr().unwrap();
+        let url = format!("127.0.0.1:{}", addr.port());
+        let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+        let child = Command::new("server")
+            .args(["--addr", &url])
+            .args(["--db-path", &datadir])
+            .args(["--esplora-url", &esplora_url])
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        Some(RegistryProc { child, url })
+    } else {
+        None
+    };
+
+    let registry_url = child
+        .as_ref()
+        .map(|r| format!("--registry-url http://{}/", r.url))
+        .unwrap_or("".to_owned());
+
+    let esplora_url = server
+        .electrs
+        .esplora_url
+        .as_ref()
+        .map(|r| format!("--esplora-api-url http://{}/", r))
+        .unwrap_or("".to_owned());
+
+    let electrum_url = &server.electrs.electrum_url;
+    let addr = get_available_addr().unwrap();
+
     let cli = format!("cli --addr {addr} -n regtest");
-    let params = format!("--datadir {datadir} --electrum-url {electrum_url}");
+    let params =
+        format!("--datadir {datadir} --electrum-url {electrum_url} {registry_url} {esplora_url}");
 
     let t = {
         let cli = cli.clone();
@@ -67,33 +132,38 @@ fn setup_cli() -> (JoinHandle<()>, TempDir, String, String, TestElectrumServer) 
     };
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    (t, tmp, cli, params, server)
+    (t, tmp, cli, params, server, child)
 }
 
 fn get_str<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).unwrap().as_str().unwrap()
 }
 
-fn get_desc(r: &Value, remove_checksum: bool) -> String {
+fn get_len(v: &Value, key: &str) -> usize {
+    v.get(key).unwrap().as_array().unwrap().len()
+}
+
+fn get_desc(r: &Value) -> String {
     let desc = get_str(r, "descriptor");
     // The returned descriptor is equivalent but it could be slightly different
     let desc = desc.replace('\'', "h");
-    if remove_checksum {
-        desc.split('#')
-            .collect::<Vec<_>>()
-            .first()
-            .unwrap()
-            .to_string()
-    } else {
-        desc.to_string()
-    }
+    // Changing the descriptor string invalidates the checksum
+    remove_checksum(&desc)
+}
+
+fn remove_checksum(desc: &str) -> String {
+    desc.split('#')
+        .collect::<Vec<_>>()
+        .first()
+        .unwrap()
+        .to_string()
 }
 
 fn sw_signer(cli: &str, name: &str) {
     let r = sh(&format!("{cli} signer generate"));
     let mnemonic = get_str(&r, "mnemonic");
     sh(&format!(
-        "{cli} signer load-software --mnemonic \"{mnemonic}\" --signer {name}"
+        "{cli} signer load-software --persist true --mnemonic \"{mnemonic}\" --signer {name}"
     ));
 }
 
@@ -168,6 +238,14 @@ fn addr_memo(cli: &str, w: &str, i: u32) -> String {
     get_str(&r, "memo").to_string()
 }
 
+fn asset_ids_from_issuance_pset(cli: &str, wallet: &str, pset: &str) -> (String, String) {
+    let r = sh(&format!("{cli} wallet pset-details -w {wallet} -p {pset}"));
+    let issuances = r.get("issuances").unwrap().as_array().unwrap();
+    let asset = get_str(&issuances[0], "asset").to_string();
+    let token = get_str(&issuances[0], "token").to_string();
+    (asset, token)
+}
+
 fn fund(server: &TestElectrumServer, cli: &str, wallet: &str, sats: u64) {
     let addr = Address::from_str(&address(cli, wallet)).unwrap();
 
@@ -177,18 +255,8 @@ fn fund(server: &TestElectrumServer, cli: &str, wallet: &str, sats: u64) {
     wait_tx(cli, wallet, &txid);
 }
 
-fn send(
-    cli: &str,
-    wallet: &str,
-    address: &str,
-    asset: &str,
-    sats: u64,
-    signers: &[&str],
-) -> String {
-    let recipient = format!(" --recipient {address}:{sats}:{asset}");
-    let r = sh(&format!("{cli} wallet send --wallet {wallet} {recipient}"));
-    let mut pset = get_str(&r, "pset").to_string();
-
+fn complete(cli: &str, wallet: &str, pset: &str, signers: &[&str]) -> String {
+    let mut pset = pset.to_string();
     for signer in signers {
         let r = sh(&format!(
             "{cli} signer sign --signer {signer} --pset {pset}"
@@ -204,22 +272,74 @@ fn send(
     txid.to_string()
 }
 
+fn send(
+    cli: &str,
+    wallet: &str,
+    address: &str,
+    asset: &str,
+    sats: u64,
+    signers: &[&str],
+) -> String {
+    let recipient = format!(" --recipient {address}:{sats}:{asset}");
+    let r = sh(&format!("{cli} wallet send --wallet {wallet} {recipient}"));
+    complete(cli, wallet, get_str(&r, "pset"), signers)
+}
+
+#[test]
+fn test_state_regression() {
+    let server = setup(false);
+    let electrum_url = &server.electrs.electrum_url;
+    let addr = get_available_addr().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let datadir = tmp.path().display().to_string();
+    let cli = format!("cli --addr {addr} -n regtest");
+    let params = format!("--datadir {datadir} --electrum-url {electrum_url}");
+
+    // copy static state into data dir
+    let state = include_str!("./test_data/state.json");
+    let mut to = tmp.as_ref().to_path_buf();
+    to.push("liquid-regtest");
+    fs::create_dir(&to).unwrap();
+    to.push("state.json");
+    fs::write(to, state).unwrap();
+
+    let t = {
+        let cli = cli.clone();
+
+        std::thread::spawn(move || {
+            sh(&format!("{cli} server start {params}"));
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let r = sh(&format!("{cli} signer list"));
+    assert_eq!(get_len(&r, "signers"), 3);
+
+    let r = sh(&format!("{cli} wallet list"));
+    assert_eq!(get_len(&r, "wallets"), 1);
+
+    let r = sh(&format!("{cli} asset list"));
+    assert_eq!(get_len(&r, "assets"), 3);
+
+    sh(&format!("{cli} server stop"));
+    t.join().unwrap();
+}
+
 #[test]
 fn test_start_stop_persist() {
-    let (t, _tmp, cli, params, _server) = setup_cli();
+    let (t, _tmp, cli, params, _server, _) = setup_cli(false);
 
-    let result = sh(&format!("{cli} signer list"));
-    let signers = result.get("signers").unwrap();
-    assert_eq!(signers.as_array().unwrap().len(), 0);
+    let r = sh(&format!("{cli} signer list"));
+    assert_eq!(get_len(&r, "signers"), 0);
 
     let mnemonic = lwk_test_util::TEST_MNEMONIC;
     sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{mnemonic}" --signer s1"#
+        r#"{cli} signer load-software --persist true --mnemonic "{mnemonic}" --signer s1"#
     ));
     let result = sh(&format!("{cli} signer generate"));
     let different_mnemonic = result.get("mnemonic").unwrap().as_str().unwrap();
     sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{different_mnemonic}" --signer s2"#,
+        r#"{cli} signer load-software --persist true --mnemonic "{different_mnemonic}" --signer s2"#,
     ));
     sh(&format!(r#"{cli} signer unload --signer s2"#)); // Verify unloads are handled
 
@@ -229,6 +349,15 @@ fn test_start_stop_persist() {
     sh(&format!(
         "{cli} signer load-jade --id 2111111111111111111111111111111111111112 --signer s3"
     ));
+    let r = sh(&format!("{cli} signer details -s s1"));
+    assert_eq!(get_str(&r, "mnemonic"), mnemonic);
+    assert_eq!(get_str(&r, "type"), "software");
+    let r = sh(&format!("{cli} signer details -s s2"));
+    assert!(r.get("mnemonic").is_none());
+    assert_eq!(get_str(&r, "type"), "external");
+    let r = sh(&format!("{cli} signer details -s s3"));
+    assert!(r.get("mnemonic").is_none());
+    assert_eq!(get_str(&r, "type"), "jade-id");
 
     let desc = "ct(c25deb86fa11e49d651d7eae27c220ef930fbd86ea023eebfa73e54875647963,elwpkh(tpubD6NzVbkrYhZ4Was8nwnZi7eiWUNJq2LFpPSCMQLioUfUtT1e72GkRbmVeRAZc26j5MRUz2hRLsaVHJfs6L7ppNfLUrm9btQTuaEsLrT7D87/*))#q9cypnmc";
     sh(&format!("{cli} wallet load --wallet custody -d {desc}"));
@@ -237,23 +366,31 @@ fn test_start_stop_persist() {
 
     let contract = "{\"entity\":{\"domain\":\"tether.to\"},\"issuer_pubkey\":\"0337cceec0beea0232ebe14cba0197a9fbd45fcf2ec946749de920e71434c2b904\",\"name\":\"Tether USD\",\"precision\":8,\"ticker\":\"USDt\",\"version\":0}";
     let asset = "ce091c998b83c78bb71a632313ba3760f1763d9cfcffae02258ffa9865a37bd2";
-    let prev_txid = "9596d259270ef5bac0020435e6d859aea633409483ba64e232b8ba04ce288668";
-    let prev_vout = 0;
+    let tx = include_str!("../../lwk_wollet/tests/data/usdt-issuance-tx.hex");
     sh(&format!(
-        "{cli} asset insert --asset {asset} --contract '{contract}' --prev-txid {prev_txid} --prev-vout {prev_vout}"
+        "{cli} asset insert --asset {asset} --contract '{contract}' --issuance-tx {tx}"
     ));
 
+    let err = sh_err(&format!("{cli} asset from-explorer --asset {asset}"));
+    assert!(err.contains("already inserted"));
+
     let expected_signers = sh(&format!("{cli} signer list"));
-    let r = expected_signers.get("signers").unwrap();
-    assert_eq!(r.as_array().unwrap().len(), 3);
+    assert_eq!(get_len(&expected_signers, "signers"), 3);
 
     let expected_wallets = sh(&format!("{cli} wallet list"));
-    let r = expected_wallets.get("wallets").unwrap();
-    assert_eq!(r.as_array().unwrap().len(), 1);
+    assert_eq!(get_len(&expected_wallets, "wallets"), 1);
 
     let expected_assets = sh(&format!("{cli} asset list"));
-    let r = expected_assets.get("assets").unwrap();
-    assert_eq!(r.as_array().unwrap().len(), 3);
+    assert_eq!(get_len(&expected_assets, "assets"), 3);
+
+    // Add another signer that is not persisted
+    let r = sh(&format!("{cli} signer generate"));
+    let m = get_str(&r, "mnemonic");
+    sh(&format!(
+        "{cli} signer load-software --persist false --mnemonic '{m}' --signer s4"
+    ));
+    let r = sh(&format!("{cli} signer list"));
+    assert_eq!(get_len(&r, "signers"), 4);
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
@@ -304,41 +441,37 @@ fn test_start_stop_persist() {
 
 #[test]
 fn test_signer_load_unload_list() {
-    let (t, _tmp, cli, _params, _server) = setup_cli();
+    let (t, _tmp, cli, _params, _server, _) = setup_cli(false);
 
-    let result = sh(&format!("{cli} signer list"));
-    let signers = result.get("signers").unwrap();
-    assert!(signers.as_array().unwrap().is_empty());
+    let r = sh(&format!("{cli} signer list"));
+    assert_eq!(get_len(&r, "signers"), 0);
 
-    let mnemonic = lwk_test_util::TEST_MNEMONIC;
-    let result = sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{mnemonic}" --signer ss "#
+    sw_signer(&cli, "s1");
+    let r = sh(&format!("{cli} signer details -s s1"));
+    let m1 = get_str(&r, "mnemonic");
+    let m2 = lwk_test_util::TEST_MNEMONIC;
+
+    assert_ne!(m1, m2);
+    // Same name, different mnemonic
+    let err = sh_err(&format!(
+        "{cli} signer load-software --persist true --mnemonic '{m2}' --signer s1"
     ));
-    assert_eq!(result.get("name").unwrap().as_str().unwrap(), "ss");
+    assert!(err.contains("Signer 's1' is already loaded"));
 
-    let result = sh(&format!("{cli} signer generate"));
-    let different_mnemonic = result.get("mnemonic").unwrap().as_str().unwrap();
-    let result = sh_result(&format!(
-        r#"{cli} signer load-software --mnemonic "{different_mnemonic}" --signer ss"#,
+    // Same mnemonic, different name
+    let err = sh_err(&format!(
+        "{cli} signer load-software --persist true --mnemonic '{m1}' --signer s2"
     ));
-    assert!(format!("{:?}", result.unwrap_err()).contains("Signer 'ss' is already loaded"));
+    assert!(err.contains("Signer 's1' is already loaded"));
 
-    let result = sh_result(&format!(
-        r#"{cli} signer load-software --mnemonic "{mnemonic}" --signer ss2 "#,
-    ));
-    assert!(format!("{:?}", result.unwrap_err()).contains("Signer 'ss' is already loaded"));
+    let r = sh(&format!("{cli} signer list"));
+    assert_eq!(get_len(&r, "signers"), 1);
 
-    let result = sh(&format!("{cli} signer list"));
-    let signers = result.get("signers").unwrap();
-    assert!(!signers.as_array().unwrap().is_empty());
+    let r = sh(&format!("{cli} signer unload --signer s1"));
+    assert_eq!(get_str(r.get("unloaded").unwrap(), "name"), "s1");
 
-    let result = sh(&format!("{cli} signer unload --signer ss"));
-    let unloaded = result.get("unloaded").unwrap();
-    assert_eq!(unloaded.get("name").unwrap().as_str().unwrap(), "ss");
-
-    let result = sh(&format!("{cli} signer list"));
-    let signers = result.get("signers").unwrap();
-    assert!(signers.as_array().unwrap().is_empty());
+    let r = sh(&format!("{cli} signer list"));
+    assert_eq!(get_len(&r, "signers"), 0);
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
@@ -346,7 +479,7 @@ fn test_signer_load_unload_list() {
 
 #[test]
 fn test_signer_external() {
-    let (t, _tmp, cli, _params, _server) = setup_cli();
+    let (t, _tmp, cli, _params, _server, _) = setup_cli(false);
 
     let name = "ext";
     let fingerprint = "11111111";
@@ -356,14 +489,14 @@ fn test_signer_external() {
     assert_eq!(r.get("name").unwrap().as_str().unwrap(), name);
 
     // Some actions are not possible with the external signer
-    let r = sh_result(&format!("{cli} signer xpub --signer {name} --kind bip84"));
-    assert!(format!("{:?}", r.unwrap_err()).contains("Invalid operation for external signer"));
-    let r = sh_result(&format!("{cli} signer sign --signer {name} --pset pset"));
-    assert!(format!("{:?}", r.unwrap_err()).contains("Invalid operation for external signer"));
-    let r = sh_result(&format!(
+    let err = sh_err(&format!("{cli} signer xpub --signer {name} --kind bip84"));
+    assert!(err.contains("Invalid operation for external signer"));
+    let err = sh_err(&format!("{cli} signer sign --signer {name} --pset pset"));
+    assert!(err.contains("Invalid operation for external signer"));
+    let err = sh_err(&format!(
         "{cli} signer singlesig-desc --signer {name} --descriptor-blinding-key slip77 --kind wpkh"
     ));
-    assert!(format!("{:?}", r.unwrap_err()).contains("Invalid operation for external signer"));
+    assert!(err.contains("Invalid operation for external signer"));
 
     // Load a wallet and see external signer name in the wallet details
     let xpub = "tpubD6NzVbkrYhZ4Was8nwnZi7eiWUNJq2LFpPSCMQLioUfUtT1e72GkRbmVeRAZc26j5MRUz2hRLsaVHJfs6L7ppNfLUrm9btQTuaEsLrT7D87";
@@ -382,35 +515,32 @@ fn test_signer_external() {
 
 #[test]
 fn test_wallet_load_unload_list() {
-    let (t, _tmp, cli, _params, _server) = setup_cli();
+    let (t, _tmp, cli, _params, _server, _) = setup_cli(false);
 
-    let result = sh(&format!("{cli} wallet list"));
-    let wallets = result.get("wallets").unwrap();
-    assert!(wallets.as_array().unwrap().is_empty());
+    let r = sh(&format!("{cli} wallet list"));
+    assert_eq!(get_len(&r, "wallets"), 0);
 
     let desc = "ct(c25deb86fa11e49d651d7eae27c220ef930fbd86ea023eebfa73e54875647963,elwpkh(tpubD6NzVbkrYhZ4Was8nwnZi7eiWUNJq2LFpPSCMQLioUfUtT1e72GkRbmVeRAZc26j5MRUz2hRLsaVHJfs6L7ppNfLUrm9btQTuaEsLrT7D87/*))#q9cypnmc";
     let result = sh(&format!("{cli} wallet load --wallet custody -d {desc}"));
     assert_eq!(result.get("descriptor").unwrap().as_str().unwrap(), desc);
 
-    let result = sh_result(&format!("{cli} wallet load --wallet custody -d {desc}"));
-    assert!(format!("{:?}", result.unwrap_err()).contains("Wallet 'custody' is already loaded"));
+    let err = sh_err(&format!("{cli} wallet load --wallet custody -d {desc}"));
+    assert!(err.contains("Wallet 'custody' is already loaded"));
 
-    let result = sh_result(&format!(
+    let err = sh_err(&format!(
         "{cli} wallet load --wallet differentname -d {desc}"
     ));
-    assert!(format!("{:?}", result.unwrap_err()).contains("Wallet 'custody' is already loaded"));
+    assert!(err.contains("Wallet 'custody' is already loaded"));
 
-    let result = sh(&format!("{cli} wallet list"));
-    let wallets = result.get("wallets").unwrap();
-    assert!(!wallets.as_array().unwrap().is_empty());
+    let r = sh(&format!("{cli} wallet list"));
+    assert_eq!(get_len(&r, "wallets"), 1);
 
     let result = sh(&format!("{cli} wallet unload --wallet custody"));
     let unloaded = result.get("unloaded").unwrap();
     assert_eq!(unloaded.get("name").unwrap().as_str().unwrap(), "custody");
 
-    let result = sh(&format!("{cli} wallet list"));
-    let wallets = result.get("wallets").unwrap();
-    assert!(wallets.as_array().unwrap().is_empty());
+    let r = sh(&format!("{cli} wallet list"));
+    assert_eq!(get_len(&r, "wallets"), 0);
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
@@ -418,7 +548,7 @@ fn test_wallet_load_unload_list() {
 
 #[test]
 fn test_wallet_memos() {
-    let (t, _tmp, cli, params, server) = setup_cli();
+    let (t, _tmp, cli, params, server, _) = setup_cli(false);
 
     // Create 2 wallets
     sw_signer(&cli, "s1");
@@ -520,106 +650,95 @@ fn test_wallet_memos() {
 
 #[test]
 fn test_wallet_details() {
-    let (t, _tmp, cli, _params, _server) = setup_cli();
+    let (t, _tmp, cli, _params, _server, _) = setup_cli(false);
 
-    let r = sh(&format!("{cli} signer generate"));
-    let m1 = r.get("mnemonic").unwrap().as_str().unwrap();
-    let r = sh(&format!(
-        "{cli} signer load-software --mnemonic \"{m1}\" --signer s1"
-    ));
-    assert_eq!(r.get("name").unwrap().as_str().unwrap(), "s1");
-
-    let r = sh(&format!("{cli} signer generate"));
-    let m2 = r.get("mnemonic").unwrap().as_str().unwrap();
-    let r = sh(&format!(
-        "{cli} signer load-software --mnemonic \"{m2}\" --signer s2"
-    ));
-    assert_eq!(r.get("name").unwrap().as_str().unwrap(), "s2");
+    sw_signer(&cli, "s1");
+    sw_signer(&cli, "s2");
 
     // Single sig wallet
     let r = sh(&format!(
         "{cli} signer singlesig-desc --signer s1 --descriptor-blinding-key slip77 --kind wpkh"
     ));
-    let desc_ss = r.get("descriptor").unwrap().as_str().unwrap();
+    let desc_ss = get_str(&r, "descriptor");
     sh(&format!("{cli} wallet load --wallet ss -d {desc_ss}"));
     assert!(desc_ss.contains(&keyorigin(&cli, "s1", "bip84")));
 
     let r = sh(&format!(
         "{cli} signer singlesig-desc --signer s1 --descriptor-blinding-key slip77 --kind shwpkh"
     ));
-    let desc_sssh = r.get("descriptor").unwrap().as_str().unwrap();
+    let desc_sssh = get_str(&r, "descriptor");
     sh(&format!("{cli} wallet load --wallet sssh -d {desc_sssh}"));
     assert!(desc_sssh.contains(&keyorigin(&cli, "s1", "bip49")));
 
-    let r = sh_result(&format!(
+    let err = sh_err(&format!(
         "{cli} signer singlesig-desc -s s1 --descriptor-blinding-key slip77-rand --kind wpkh"
     ));
-    let err = "Random slip77 key not supported in singlesig descriptor generation";
-    assert!(format!("{:?}", r.unwrap_err()).contains(err));
+    let exp_err = "Random slip77 key not supported in singlesig descriptor generation";
+    assert!(err.contains(exp_err));
 
     // Multi sig wallet
     let r = sh(&format!("{cli} signer xpub --signer s1 --kind bip87"));
-    let xpub1 = r.get("keyorigin_xpub").unwrap().as_str().unwrap();
+    let xpub1 = get_str(&r, "keyorigin_xpub");
     let r = sh(&format!("{cli} signer xpub --signer s2 --kind bip87"));
-    let xpub2 = r.get("keyorigin_xpub").unwrap().as_str().unwrap();
+    let xpub2 = get_str(&r, "keyorigin_xpub");
     let r = sh(&format!("{cli} wallet multisig-desc --descriptor-blinding-key slip77-rand --kind wsh --threshold 2 --keyorigin-xpub {xpub1} --keyorigin-xpub {xpub2}"));
-    let desc_ms = r.get("descriptor").unwrap().as_str().unwrap();
+    let desc_ms = get_str(&r, "descriptor");
     sh(&format!("{cli} wallet load --wallet ms -d {desc_ms}"));
 
-    let r = sh_result(&format!("{cli} wallet multisig-desc --descriptor-blinding-key slip77 --kind wsh --threshold 2 --keyorigin-xpub {xpub1} --keyorigin-xpub {xpub2}"));
-    let err = "Deterministic slip77 key not supported in multisig descriptor generation";
-    assert!(format!("{:?}", r.unwrap_err()).contains(err));
+    let err = sh_err(&format!("{cli} wallet multisig-desc --descriptor-blinding-key slip77 --kind wsh --threshold 2 --keyorigin-xpub {xpub1} --keyorigin-xpub {xpub2}"));
+    let exp_err = "Deterministic slip77 key not supported in multisig descriptor generation";
+    assert!(err.contains(exp_err));
 
     // Multi sig wallet, same signers
     let r = sh(&format!("{cli} wallet multisig-desc --descriptor-blinding-key slip77-rand --kind wsh --threshold 2 --keyorigin-xpub {xpub1} --keyorigin-xpub {xpub1}"));
-    let desc_ms_same_signers = r.get("descriptor").unwrap().as_str().unwrap();
+    let desc_ms_same_signers = get_str(&r, "descriptor");
     sh(&format!(
         "{cli} wallet load --wallet ms_same_signers -d {desc_ms_same_signers}"
     ));
 
     // Details
     let r = sh(&format!("{cli} wallet details --wallet ss"));
-    assert_eq!(get_desc(&r, true), desc_ss);
-    assert!(r.get("warnings").unwrap().as_str().unwrap().is_empty());
-    assert_eq!(r.get("type").unwrap().as_str().unwrap(), "wpkh");
+    assert_eq!(get_desc(&r), remove_checksum(desc_ss));
+    assert!(get_str(&r, "warnings").is_empty());
+    assert_eq!(get_str(&r, "type"), "wpkh");
     let signers = r.get("signers").unwrap().as_array().unwrap();
     assert_eq!(signers.len(), 1);
-    assert_eq!(signers[0].get("name").unwrap().as_str().unwrap(), "s1");
+    assert_eq!(get_str(&signers[0], "name"), "s1");
 
     let r = sh(&format!("{cli} wallet details --wallet sssh"));
-    assert_eq!(get_desc(&r, true), desc_sssh);
-    assert!(r.get("warnings").unwrap().as_str().unwrap().is_empty());
-    assert_eq!(r.get("type").unwrap().as_str().unwrap(), "sh_wpkh");
+    assert_eq!(get_desc(&r), remove_checksum(desc_sssh));
+    assert!(get_str(&r, "warnings").is_empty());
+    assert_eq!(get_str(&r, "type"), "sh_wpkh");
     let signers = r.get("signers").unwrap().as_array().unwrap();
     assert_eq!(signers.len(), 1);
-    assert_eq!(signers[0].get("name").unwrap().as_str().unwrap(), "s1");
+    assert_eq!(get_str(&signers[0], "name"), "s1");
 
     let r = sh(&format!("{cli} wallet details --wallet ms"));
-    assert_eq!(get_desc(&r, true), desc_ms);
-    assert!(r.get("warnings").unwrap().as_str().unwrap().is_empty());
-    assert_eq!(r.get("type").unwrap().as_str().unwrap(), "wsh_multi_2of2");
+    assert_eq!(get_desc(&r), remove_checksum(desc_ms));
+    assert!(get_str(&r, "warnings").is_empty());
+    assert_eq!(get_str(&r, "type"), "wsh_multi_2of2");
     let signers = r.get("signers").unwrap().as_array().unwrap();
     assert_eq!(signers.len(), 2);
-    assert_eq!(signers[0].get("name").unwrap().as_str().unwrap(), "s1");
-    assert_eq!(signers[1].get("name").unwrap().as_str().unwrap(), "s2");
+    assert_eq!(get_str(&signers[0], "name"), "s1");
+    assert_eq!(get_str(&signers[1], "name"), "s2");
 
     sh(&format!("{cli} signer unload --signer s2"));
     let r = sh(&format!("{cli} wallet details --wallet ms"));
     let signers = r.get("signers").unwrap().as_array().unwrap();
     assert_eq!(signers.len(), 2);
-    assert_eq!(signers[0].get("name").unwrap().as_str().unwrap(), "s1");
+    assert_eq!(get_str(&signers[0], "name"), "s1");
     assert!(signers[1].get("name").is_none());
 
     let r = sh(&format!("{cli} wallet details --wallet ms_same_signers"));
     assert_eq!(
-        r.get("warnings").unwrap().as_str().unwrap(),
+        get_str(&r, "warnings"),
         "wallet has multiple signers with the same fingerprint"
     );
     assert_eq!(r.get("type").unwrap().as_str().unwrap(), "wsh_multi_2of2");
     let signers = r.get("signers").unwrap().as_array().unwrap();
     assert_eq!(signers.len(), 2);
-    assert_eq!(signers[0].get("name").unwrap().as_str().unwrap(), "s1");
-    assert_eq!(signers[1].get("name").unwrap().as_str().unwrap(), "s1");
+    assert_eq!(get_str(&signers[0], "name"), "s1");
+    assert_eq!(get_str(&signers[1], "name"), "s1");
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
@@ -627,61 +746,17 @@ fn test_wallet_details() {
 
 #[test]
 fn test_broadcast() {
-    let (t, _tmp, cli, _params, server) = setup_cli();
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
 
-    let result = sh(&format!("{cli} signer generate"));
-    let mnemonic = result.get("mnemonic").unwrap().as_str().unwrap();
-
-    let result = sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{mnemonic}" --signer s1 "#
-    ));
-    assert_eq!(result.get("name").unwrap().as_str().unwrap(), "s1");
-
-    let result = sh(&format!(
-        r#"{cli} signer singlesig-desc --signer s1 --descriptor-blinding-key slip77 --kind wpkh"#
-    ));
-    let desc_generated = result.get("descriptor").unwrap().as_str().unwrap();
-
-    let result = sh(&format!(
-        r#"{cli} wallet load --wallet w1 -d {desc_generated}"#
-    ));
-    assert_eq!(
-        result.get("descriptor").unwrap().as_str().unwrap(),
-        desc_generated
-    );
-
+    sw_signer(&cli, "s1");
+    singlesig_wallet(&cli, "w1", "s1", "slip77", "wpkh");
     fund(&server, &cli, "w1", 1_000_000);
 
-    let regtest_policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
-    sh(&format!("{cli} server scan"));
-    let result = sh(&format!("{cli} wallet balance --wallet w1"));
-    let balance_obj = result.get("balance").unwrap();
-    let policy_obj = balance_obj.get(regtest_policy_asset).unwrap();
-    assert_eq!(policy_obj.as_number().unwrap().as_u64().unwrap(), 1_000_000);
-
-    let node_address = server.node_getnewaddress();
-    let result = sh(&format!(
-        r#"{cli} wallet send --wallet w1 --recipient {node_address}:1000:{regtest_policy_asset}"#
-    ));
-    let pset = result.get("pset").unwrap().as_str().unwrap();
-    let pset_unsigned: PartiallySignedTransaction = pset.parse().unwrap();
-
-    let result = sh(&format!(r#"{cli} signer sign --signer s1 --pset {pset}"#));
-    let pset = result.get("pset").unwrap().as_str().unwrap();
-    let pset_signed: PartiallySignedTransaction = pset.parse().unwrap();
-
-    assert_ne!(pset_signed, pset_unsigned);
-
-    let result = sh(&format!(
-        r#"{cli} wallet broadcast --wallet w1 --pset {pset_signed}"#
-    ));
-    assert!(result.get("txid").unwrap().as_str().is_some());
-
-    sh(&format!("{cli} server scan"));
-    let result = sh(&format!("{cli} wallet balance --wallet w1"));
-    let balance_obj = result.get("balance").unwrap();
-    let policy_obj = balance_obj.get(regtest_policy_asset).unwrap();
-    assert!(policy_obj.as_number().unwrap().as_u64().unwrap() < 1_000_000);
+    let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
+    assert_eq!(1_000_000, get_balance(&cli, "w1", policy_asset));
+    let addr = server.node_getnewaddress().to_string();
+    send(&cli, "w1", &addr, policy_asset, 1000, &["s1"]);
+    assert!(1_000_000 > get_balance(&cli, "w1", policy_asset));
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
@@ -689,24 +764,10 @@ fn test_broadcast() {
 
 #[test]
 fn test_issue() {
-    let (t, _tmp, cli, _params, server) = setup_cli();
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
 
-    let r = sh(&format!("{cli} signer generate"));
-    let mnemonic = r.get("mnemonic").unwrap().as_str().unwrap();
-
-    let r = sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{mnemonic}" --signer s1 "#
-    ));
-    assert_eq!(r.get("name").unwrap().as_str().unwrap(), "s1");
-
-    let r = sh(&format!(
-        "{cli} signer singlesig-desc --signer s1 --descriptor-blinding-key slip77 --kind wpkh"
-    ));
-    let desc = r.get("descriptor").unwrap().as_str().unwrap();
-
-    let r = sh(&format!("{cli} wallet load --wallet w1 -d {desc}"));
-    assert_eq!(r.get("descriptor").unwrap().as_str().unwrap(), desc);
-
+    sw_signer(&cli, "s1");
+    singlesig_wallet(&cli, "w1", "s1", "slip77", "wpkh");
     fund(&server, &cli, "w1", 1_000_000);
 
     let r = sh(&format!("{cli} asset contract --domain example.com --issuer-pubkey 035d0f7b0207d9cc68870abfef621692bce082084ed3ca0c1ae432dd12d889be01 --name example --ticker EXMP"));
@@ -714,13 +775,13 @@ fn test_issue() {
     let r = sh(&format!(
         "{cli} wallet issue --wallet w1 --satoshi-asset 1000 --satoshi-token 1 --contract '{contract}'"
     ));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
+    let pset = get_str(&r, "pset");
     let pset_unsigned: PartiallySignedTransaction = pset.parse().unwrap();
 
     let r = sh(&format!("{cli} wallet pset-details --wallet w1 -p {pset}"));
-    assert!(r.get("warnings").unwrap().as_str().unwrap().is_empty());
+    assert!(get_str(&r, "warnings").is_empty());
     assert!(r.get("fee").unwrap().as_u64().unwrap() > 0);
-    assert!(r.get("reissuances").unwrap().as_array().unwrap().is_empty());
+    assert_eq!(get_len(&r, "reissuances"), 0);
     let issuances = r.get("issuances").unwrap().as_array().unwrap();
     assert_eq!(issuances.len(), 1);
     let issuance = &issuances[0].as_object().unwrap();
@@ -732,8 +793,6 @@ fn test_issue() {
     let token_sats = issuance.get("token_satoshi").unwrap().as_u64().unwrap();
     assert_eq!(asset_sats, 1000);
     assert_eq!(token_sats, 1);
-    let prev_txid = issuance.get("prev_txid").unwrap().as_str().unwrap();
-    let prev_vout = issuance.get("prev_vout").unwrap().as_u64().unwrap();
 
     let balance = r.get("balance").unwrap().as_object().unwrap();
     // TODO: util to check balance with less unwrap
@@ -755,85 +814,72 @@ fn test_issue() {
     let r = sh(&format!(
         "{cli} wallet broadcast --wallet w1 --pset {pset_signed}"
     ));
-    assert!(r.get("txid").unwrap().as_str().is_some());
+    let issuance_txid = get_str(&r, "txid");
     sh(&format!("{cli} server scan"));
 
     let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
-    let r = sh(&format!("{cli} wallet balance --wallet w1"));
-    let balance = r.get("balance").unwrap().as_object().unwrap();
-    assert_eq!(balance.get(asset).unwrap().as_u64().unwrap(), 1000);
+    assert_eq!(get_balance(&cli, "w1", asset), 1000);
 
     let r = sh(&format!("{cli} wallet balance --wallet w1 --with-tickers"));
     let balance = r.get("balance").unwrap().as_object().unwrap();
     assert!(balance.get("L-BTC").unwrap().as_u64().unwrap() > 0);
 
     let r = sh(&format!("{cli} asset details --asset {policy_asset}"));
-    let name = r.get("name").unwrap().as_str().unwrap();
-    assert_eq!(name, "liquid bitcoin");
-    assert_eq!(r.get("ticker").unwrap().as_str().unwrap(), "L-BTC");
+    assert_eq!(get_str(&r, "name"), "liquid bitcoin");
+    assert_eq!(get_str(&r, "ticker"), "L-BTC");
 
     let r = sh(&format!("{cli} asset list"));
-    let assets = r.get("assets").unwrap().as_array().unwrap();
-    assert_eq!(assets.len(), 1);
+    assert_eq!(get_len(&r, "assets"), 1);
 
-    let prevout = format!("--prev-txid {prev_txid} --prev-vout {prev_vout}");
+    let r = sh(&format!("{cli} wallet tx -w w1 -t {issuance_txid}"));
+    let tx = get_str(&r, "tx");
     sh(&format!(
-        "{cli} asset insert --asset {asset} --contract '{contract}' {prevout}"
+        "{cli} asset insert --asset {asset} --contract '{contract}' --issuance-tx {tx}"
     ));
 
-    let result = sh(&format!("{cli} asset list"));
-    let assets = result.get("assets").unwrap().as_array().unwrap();
-    assert_eq!(assets.len(), 3);
+    let r = sh(&format!("{cli} asset list"));
+    assert_eq!(get_len(&r, "assets"), 3);
 
     let r = sh(&format!("{cli} asset details --asset {asset}"));
-    let name = r.get("name").unwrap().as_str().unwrap();
+    let name = get_str(&r, "name");
     assert_eq!(name, "example");
 
     let reissuance_token_name = &format!("reissuance token for {name}");
     let r = sh(&format!("{cli} asset details --asset {token}"));
-    let name = r.get("name").unwrap().as_str().unwrap();
-    assert_eq!(name, reissuance_token_name);
+    assert_eq!(get_str(&r, "name"), reissuance_token_name);
 
     sh(&format!("{cli} asset remove --asset {token}"));
     let r = sh(&format!("{cli} asset list"));
-    let assets = r.get("assets").unwrap().as_array().unwrap();
-    assert_eq!(assets.len(), 2);
+    assert_eq!(get_len(&r, "assets"), 2);
 
     let asset_balance_pre = get_balance(&cli, "w1", asset);
     let node_address = server.node_getnewaddress();
     let recipient = format!("--recipient {node_address}:1:{asset}");
     let r = sh(&format!("{cli} wallet send --wallet w1 {recipient}"));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
     // TODO: add PSET introspection verifying there are asset metadata
-    let r = sh(&format!("{cli} signer sign --signer s1 --pset {pset}"));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
-    let r = sh(&format!("{cli} wallet broadcast --wallet w1 --pset {pset}"));
-    let _txid = r.get("txid").unwrap().as_str().unwrap();
+    complete(&cli, "w1", get_str(&r, "pset"), &["s1"]);
     let asset_balance_post = get_balance(&cli, "w1", asset);
     assert_eq!(asset_balance_pre, asset_balance_post + 1);
 
     let r = sh(&format!(
         "{cli} wallet reissue --wallet w1 --asset {asset} --satoshi-asset 1"
     ));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
-    let r = sh(&format!("{cli} signer sign --signer s1 --pset {pset}"));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
-    let r = sh(&format!("{cli} wallet broadcast --wallet w1 --pset {pset}"));
-    let _txid = r.get("txid").unwrap().as_str().unwrap();
+    complete(&cli, "w1", get_str(&r, "pset"), &["s1"]);
     assert_eq!(asset_balance_post + 1, get_balance(&cli, "w1", asset));
 
     let recipient = format!("--recipient burn:1:{asset}");
     let r = sh(&format!("{cli} wallet send --wallet w1 {recipient}"));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
-    let r = sh(&format!("{cli} signer sign --signer s1 --pset {pset}"));
-    let pset = r.get("pset").unwrap().as_str().unwrap();
-    let r = sh(&format!("{cli} wallet broadcast --wallet w1 --pset {pset}"));
-    let _txid = r.get("txid").unwrap().as_str().unwrap();
+    complete(&cli, "w1", get_str(&r, "pset"), &["s1"]);
     assert_eq!(asset_balance_post, get_balance(&cli, "w1", asset));
 
+    let r = sh(&format!(
+        "{cli} wallet burn -w w1 --asset {asset} --satoshi-asset 1"
+    ));
+    complete(&cli, "w1", get_str(&r, "pset"), &["s1"]);
+    assert_eq!(asset_balance_post - 1, get_balance(&cli, "w1", asset));
+
     let r = sh(&format!("{cli} wallet utxos --wallet w1"));
-    let utxos = r.get("utxos").unwrap().as_array().unwrap();
-    assert!(!utxos.is_empty());
+    assert_eq!(get_len(&r, "utxos"), 4);
 
     let r = sh(&format!("{cli} wallet txs --wallet w1"));
     let txs = r.get("txs").unwrap().as_array().unwrap();
@@ -870,13 +916,41 @@ fn test_issue() {
     let balance = txs[0].get("balance").unwrap().as_object().unwrap();
     assert!(balance.contains_key("L-BTC"));
 
+    // Move the reissuance token to another wallet and perform an "external" reissuance
+    sw_signer(&cli, "s2");
+    singlesig_wallet(&cli, "w2", "s2", "slip77", "wpkh");
+    fund(&server, &cli, "w2", 1_000_000);
+    let w2_addr = address(&cli, "w2");
+    let txid = send(&cli, "w1", &w2_addr, token, 1, &["s1"]);
+    wait_tx(&cli, "w2", &txid);
+    let r = sh(&format!(
+        "{cli} wallet reissue --wallet w2 --asset {asset} --satoshi-asset 1"
+    ));
+    complete(&cli, "w2", get_str(&r, "pset"), &["s2"]);
+    assert_eq!(1, get_balance(&cli, "w2", asset));
+
+    // Removing the asset will cause the "external" reissuance to fail
+    sh(&format!("{cli} asset remove --asset {asset}"));
+    let err = sh_err(&format!(
+        "{cli} wallet reissue --wallet w2 --asset {asset} --satoshi-asset 1"
+    ));
+    assert!(err.contains("Missing issuance"));
+
+    let err = sh_err(&format!("{cli} wallet tx -w w2 -t {issuance_txid}"));
+    assert!(err.contains("was not found in wallet 'w2'"));
+
+    // w2 can get the tx from the explorer
+    sh(&format!(
+        "{cli} wallet tx -w w2 -t {issuance_txid} --from-explorer"
+    ));
+
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
 }
 
 #[test]
 fn test_jade_emulator() {
-    let (t, _tmp, cli, _params, server) = setup_cli();
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
 
     let docker = clients::Cli::default();
     let container = docker.run(JadeEmulator);
@@ -887,10 +961,13 @@ fn test_jade_emulator() {
     let identifier = result.get("identifier").unwrap().as_str().unwrap();
     assert_eq!(identifier, "e3ebcc79ebfedb4f2ae34406827dc1c5cb48e11f");
 
-    let result = sh(&format!(
+    sh(&format!(
         "{cli} signer load-jade --signer emul --id {identifier}  --emulator {jade_addr}"
     ));
-    assert!(result.get("id").is_some());
+    let r = sh(&format!("{cli} signer details -s emul"));
+    assert!(r.get("id").is_some());
+    assert!(r.get("mnemonic").is_none());
+    assert_eq!(get_str(&r, "type"), "jade");
     // Load singlesig wallets
     singlesig_wallet(&cli, "ss-wpkh", "emul", "slip77", "wpkh");
     singlesig_wallet(&cli, "ss-shwpkh", "emul", "slip77", "shwpkh");
@@ -910,11 +987,11 @@ fn test_jade_emulator() {
     sh(&format!("{cli} wallet address -w multi -s emul"));
 
     singlesig_wallet(&cli, "ss-sw", "sw", "slip77", "wpkh");
-    let r = sh_result(&format!("{cli} wallet address -w ss-sw -s emul"));
-    assert!(format!("{:?}", r.unwrap_err()).contains("Signer is not in wallet"));
+    let err = sh_err(&format!("{cli} wallet address -w ss-sw -s emul"));
+    assert!(err.contains("Signer is not in wallet"));
 
-    let r = sh_result(&format!("{cli} wallet address -w ss-sw -s sw"));
-    assert!(format!("{:?}", r.unwrap_err()).contains("Cannot display address with software signer"));
+    let err = sh_err(&format!("{cli} wallet address -w ss-sw -s sw"));
+    assert!(err.contains("Cannot display address with software signer"));
 
     sh(&format!("{cli} server stop"));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -923,7 +1000,7 @@ fn test_jade_emulator() {
 
 #[test]
 fn test_commands() {
-    let (t, _tmp, cli, _params, server) = setup_cli();
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
 
     let result = sh(&format!("{cli} signer generate"));
     assert!(result.get("mnemonic").is_some());
@@ -932,10 +1009,8 @@ fn test_commands() {
     let result = sh(&format!("{cli} wallet load --wallet custody -d {desc}"));
     assert_eq!(result.get("descriptor").unwrap().as_str().unwrap(), desc);
 
-    let result = sh_result(&format!("{cli} wallet load --wallet wrong -d wrong"));
-    assert!(
-        format!("{:?}", result.unwrap_err()).contains("Invalid descriptor: Not a CT Descriptor")
-    );
+    let err = sh_err(&format!("{cli} wallet load --wallet wrong -d wrong"));
+    assert!(err.contains("Invalid descriptor: Not a CT Descriptor"));
 
     fund(&server, &cli, "custody", 1_000_000);
 
@@ -945,16 +1020,29 @@ fn test_commands() {
     let policy_obj = balance_obj.get(asset).unwrap();
     assert_eq!(policy_obj.as_number().unwrap().as_u64().unwrap(), 1000000);
 
-    let result = sh_result(&format!("{cli}  wallet balance --wallet notexist"));
-    assert!(format!("{:?}", result.unwrap_err()).contains("Wallet 'notexist' does not exist"));
+    let err = sh_err(&format!("{cli}  wallet balance --wallet notexist"));
+    assert!(err.contains("Wallet 'notexist' does not exist"));
 
-    let result = sh(&format!("{cli} wallet address --wallet custody"));
-    assert_eq!(result.get("address").unwrap().as_str().unwrap(), "el1qqdtwgfchn6rtl8peyw6afhrkpphqlyxls04vlwycez2fz6l7chlhxr8wtvy9s2v34f9sk0e2g058p0dwdp9kj38296xw5ur70");
-    assert_eq!(result.get("index").unwrap().as_u64().unwrap(), 1);
+    let r = sh(&format!("{cli} wallet address --wallet custody"));
+    assert_eq!(get_str(&r, "address"), "el1qqdtwgfchn6rtl8peyw6afhrkpphqlyxls04vlwycez2fz6l7chlhxr8wtvy9s2v34f9sk0e2g058p0dwdp9kj38296xw5ur70");
+    assert_eq!(r.get("index").unwrap().as_u64().unwrap(), 1);
 
-    let result = sh(&format!("{cli} wallet address --wallet custody --index 0"));
-    assert_eq!(result.get("address").unwrap().as_str().unwrap(), "el1qqg0nthgrrl4jxeapsa40us5d2wv4ps2y63pxwqpf3zk6y69jderdtzfyr95skyuu3t03sh0fvj09f9xut8erjly3ndquhu0ry");
-    assert_eq!(result.get("index").unwrap().as_u64().unwrap(), 0);
+    let r = sh(&format!("{cli} wallet address --wallet custody --index 0"));
+    assert_eq!(get_str(&r, "address"), "el1qqg0nthgrrl4jxeapsa40us5d2wv4ps2y63pxwqpf3zk6y69jderdtzfyr95skyuu3t03sh0fvj09f9xut8erjly3ndquhu0ry");
+    assert_eq!(r.get("index").unwrap().as_u64().unwrap(), 0);
+
+    let cli_addr = format!("{cli} wallet address --wallet custody");
+    let r = sh(&format!("{cli_addr} --with-text-qr"));
+    assert!(get_str(&r, "text_qr").contains('█'));
+    assert!(r.get("uri_qr").is_none());
+
+    let r = sh(&format!("{cli_addr} --with-uri-qr 1"));
+    assert!(r.get("text_qr").is_none());
+    assert!(get_str(&r, "uri_qr").contains("data:image/bmp;base64"));
+
+    let r = sh(&format!("{cli_addr} --with-uri-qr 1 --with-text-qr"));
+    assert!(get_str(&r, "text_qr").contains('█'));
+    assert!(get_str(&r, "uri_qr").contains("data:image/bmp;base64"));
 
     let result = sh(&format!("{cli} wallet send --wallet custody --recipient el1qqdtwgfchn6rtl8peyw6afhrkpphqlyxls04vlwycez2fz6l7chlhxr8wtvy9s2v34f9sk0e2g058p0dwdp9kj38296xw5ur70:2:5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225"));
     let pset = result.get("pset").unwrap().as_str().unwrap();
@@ -967,7 +1055,7 @@ fn test_commands() {
 
     let mnemonic = lwk_test_util::TEST_MNEMONIC;
     let result = sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{mnemonic}" --signer ss "#
+        r#"{cli} signer load-software --persist true --mnemonic "{mnemonic}" --signer ss "#
     ));
     assert_eq!(result.get("name").unwrap().as_str().unwrap(), "ss");
 
@@ -1008,18 +1096,10 @@ fn test_commands() {
 
 #[test]
 fn test_multisig() {
-    let (t, _tmp, cli, _params, server) = setup_cli();
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
 
-    let r = sh(&format!("{cli} signer generate"));
-    let m1 = r.get("mnemonic").unwrap().as_str().unwrap();
-    sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{m1}" --signer s1 "#
-    ));
-    let r = sh(&format!("{cli} signer generate"));
-    let m2 = r.get("mnemonic").unwrap().as_str().unwrap();
-    sh(&format!(
-        r#"{cli} signer load-software --mnemonic "{m2}" --signer s2 "#
-    ));
+    sw_signer(&cli, "s1");
+    sw_signer(&cli, "s2");
 
     let r = sh(&format!("{cli} signer xpub --signer s1 --kind bip87"));
     let keyorigin_xpub1 = r.get("keyorigin_xpub").unwrap().as_str().unwrap();
@@ -1126,15 +1206,15 @@ fn test_multisig() {
 
 #[test]
 fn test_inconsistent_network() {
-    let (_t, _tmp, cli, _params, _server) = setup_cli();
+    let (_t, _tmp, cli, _params, _server, _) = setup_cli(false);
     let cli_addr = cli.split(" -n").next().unwrap();
-    let r = sh_result(&format!("{cli_addr} -n testnet wallet list"));
-    assert!(format!("{:?}", r.unwrap_err()).contains("Inconsistent network"));
+    let err = sh_err(&format!("{cli_addr} -n testnet wallet list"));
+    assert!(err.contains("Inconsistent network"));
 }
 
 #[test]
 fn test_schema() {
-    let (t, _tmp, cli, _params, _server) = setup_cli();
+    let (t, _tmp, cli, _params, _server, _) = setup_cli(false);
 
     for a in ServerSubCommandsEnum::value_variants() {
         let a = a.to_possible_value();
@@ -1180,9 +1260,71 @@ fn test_schema() {
     t.join().unwrap();
 }
 
+#[cfg_attr(
+    not(feature = "registry"),
+    ignore = "require registry `server` executable in path"
+)]
+#[test]
+fn test_registry_publish() {
+    let (t, _tmp, cli, _params, server, _registry) = setup_cli(true);
+
+    sw_signer(&cli, "s1");
+    singlesig_wallet(&cli, "w1", "s1", "slip77", "wpkh");
+    fund(&server, &cli, "w1", 1_000_000);
+
+    let r = sh(&format!("{cli} asset contract --domain example.com --issuer-pubkey 035d0f7b0207d9cc68870abfef621692bce082084ed3ca0c1ae432dd12d889be01 --name example --ticker EXMP"));
+    let contract = serde_json::to_string(&r).unwrap();
+    let r = sh(&format!(
+        "{cli} wallet issue --wallet w1 --satoshi-asset 1000 --satoshi-token 1 --contract '{contract}'"
+    ));
+    let pset = get_str(&r, "pset");
+
+    let r = sh(&format!("{cli} wallet pset-details --wallet w1 -p {pset}"));
+    let issuances = r.get("issuances").unwrap().as_array().unwrap();
+    let issuance = &issuances[0].as_object().unwrap();
+    let asset = issuance.get("asset").unwrap().as_str().unwrap();
+    let token = issuance.get("token").unwrap().as_str().unwrap();
+
+    let r = sh(&format!("{cli} signer sign --signer s1 --pset {pset}"));
+    let pset = r.get("pset").unwrap().as_str().unwrap();
+    let pset_signed: PartiallySignedTransaction = pset.parse().unwrap();
+
+    sh(&format!(
+        "{cli} wallet broadcast --wallet w1 --pset {pset_signed}"
+    ));
+
+    server.generate(2);
+    wait_ms(6_000); // otherwise registry may find the issuance tx unconfirmed, wait_tx is not enough
+
+    sh(&format!("{cli} server scan"));
+
+    let tx = serialize(&pset_signed.extract_tx().unwrap()).to_hex();
+    sh(&format!(
+        "{cli} asset insert --asset {asset} --contract '{contract}' --issuance-tx {tx}"
+    ));
+    let r = sh(&format!("{cli} asset list"));
+    assert_eq!(get_len(&r, "assets"), 3);
+
+    sh(&format!("{cli} asset publish --asset {asset}"));
+
+    sh(&format!("{cli} asset remove --asset {asset}"));
+
+    sh(&format!("{cli} asset remove --asset {token}"));
+
+    sh(&format!("{cli} asset list"));
+
+    sh(&format!("{cli} asset from-explorer --asset {asset}"));
+
+    sh(&format!("{cli} asset list"));
+    assert_eq!(get_len(&r, "assets"), 3);
+
+    sh(&format!("{cli} server stop"));
+    t.join().unwrap();
+}
+
 #[test]
 fn test_elip151() {
-    let (t, _tmp, cli, _params, _server) = setup_cli();
+    let (t, _tmp, cli, _params, _server, _) = setup_cli(false);
 
     sw_signer(&cli, "s1");
     sw_signer(&cli, "s2");
@@ -1221,11 +1363,10 @@ fn test_elip151() {
     // Registering the sw wallet works (no-op)
     sh(&format!("{cli} signer register-multisig -s s1 --wallet mj"));
     // Jade fails though because it does not support elip151 keys
-    let r = sh_result(&format!(
+    let err = sh_err(&format!(
         "{cli} signer register-multisig -s emul --wallet mj"
     ));
-    assert!(format!("{:?}", r.unwrap_err())
-        .contains("Jade Error: Only slip77 master blinding key are supported"));
+    assert!(err.contains("Jade Error: Only slip77 master blinding key are supported"));
 
     // Jade does not support elip151 for singlesig too,
     // but since it assumes that the key is slip77 we can do nothing about it.
@@ -1234,10 +1375,55 @@ fn test_elip151() {
     ));
     let desc_ssj = r.get("descriptor").unwrap().as_str().unwrap();
     sh(&format!("{cli} wallet load -w ssj -d {desc_ssj}"));
-    let r = sh_result(&format!("{cli} wallet address -w ssj -s emul"));
-    assert!(
-        format!("{:?}", r.unwrap_err()).contains("Mismatching addresses between wallet and jade")
-    );
+    let err = sh_err(&format!("{cli} wallet address -w ssj -s emul"));
+    assert!(err.contains("Mismatching addresses between wallet and jade"));
+
+    sh(&format!("{cli} server stop"));
+    t.join().unwrap();
+}
+
+#[test]
+fn test_3of5() {
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
+
+    sw_signer(&cli, "s1");
+    sw_signer(&cli, "s2");
+    sw_signer(&cli, "s3");
+    sw_signer(&cli, "s4");
+    sw_signer(&cli, "s5");
+
+    let signers = &["s1", "s2", "s3", "s4", "s5"];
+    multisig_wallet(&cli, "multi", 3, signers, "elip151");
+
+    fund(&server, &cli, "multi", 1_000_000);
+
+    let r = sh(&format!(
+        "{cli} wallet issue --wallet multi --satoshi-asset 1000 --satoshi-token 1"
+    ));
+    let pset = get_str(&r, "pset");
+    let (asset, token) = asset_ids_from_issuance_pset(&cli, "multi", pset);
+    let (asset, token) = (&asset, &token);
+    complete(&cli, "multi", pset, signers);
+    assert_eq!(1000, get_balance(&cli, "multi", asset));
+    assert_eq!(1, get_balance(&cli, "multi", token));
+
+    let r = sh(&format!(
+        "{cli} wallet reissue --wallet multi --asset {asset} --satoshi-asset 1"
+    ));
+    complete(&cli, "multi", get_str(&r, "pset"), signers);
+    assert_eq!(1001, get_balance(&cli, "multi", asset));
+    assert_eq!(1, get_balance(&cli, "multi", token));
+
+    sh(&format!("{cli} server stop"));
+    t.join().unwrap();
+}
+
+#[test]
+fn test_start_errors() {
+    let (t, _tmp, cli, params, _server, _) = setup_cli(false);
+
+    let err = sh_err(&format!("{cli} server start {params}"));
+    assert!(err.contains("It is probably already running."));
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();

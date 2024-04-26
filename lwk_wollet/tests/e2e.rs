@@ -3,6 +3,9 @@ mod test_jade;
 use crate::test_jade::jade_setup;
 use electrum_client::ScriptStatus;
 use elements::bitcoin::{bip32::DerivationPath, XKeyIdentifier};
+use elements::encode::deserialize;
+use elements::hex::FromHex;
+use elements::Transaction;
 use lwk_common::Signer;
 use lwk_containers::testcontainers::clients::Cli;
 use lwk_signer::*;
@@ -465,7 +468,7 @@ fn multiple_descriptors() {
 
     let mut pset = wallet_t
         .tx_builder()
-        .reissue_asset(*asset, satoshi_ar, Some(address_a))
+        .reissue_asset(*asset, satoshi_ar, Some(address_a), None)
         .unwrap()
         .finish()
         .unwrap();
@@ -487,6 +490,59 @@ fn multiple_descriptors() {
     wallet_a.sync();
     assert_eq!(wallet_a.balance(asset), satoshi_a + satoshi_ar);
     assert_eq!(wallet_t.balance(token), satoshi_t);
+
+    // Send the reissuance token to another wallet and issue from there
+    let signer_nt = generate_signer();
+    let view_key_nt = generate_view_key();
+    let desc_nt = format!("ct({},elwpkh({}/*))", view_key_nt, signer_nt.xpub());
+    let mut wallet_nt = TestWollet::new(&server.electrs.electrum_url, &desc_nt);
+
+    wallet_nt.fund_btc(&server);
+    let address_nt = wallet_nt.address();
+    let mut pset = wallet_t
+        .tx_builder()
+        .add_recipient(&address_nt, satoshi_t, *token)
+        .unwrap()
+        .finish()
+        .unwrap();
+    wallet_t.sign(&signer_t1, &mut pset);
+    wallet_t.sign(&signer_t2, &mut pset);
+    wallet_t.send(&mut pset);
+    wallet_nt.sync();
+    assert_eq!(wallet_nt.balance(token), satoshi_t);
+    assert_eq!(wallet_t.balance(token), 0);
+
+    let issuance = wallet_t
+        .wollet
+        .issuances()
+        .unwrap()
+        .into_iter()
+        .find(|i| !i.is_reissuance)
+        .unwrap();
+    assert!(wallet_nt
+        .wollet
+        .transaction(&issuance.txid)
+        .unwrap()
+        .is_none());
+    let issuance_tx = wallet_t
+        .wollet
+        .transaction(&issuance.txid)
+        .unwrap()
+        .unwrap()
+        .tx
+        .clone();
+    let address_a = wallet_a.address();
+    let mut pset = wallet_nt
+        .tx_builder()
+        .reissue_asset(*asset, satoshi_ar, Some(address_a), Some(issuance_tx))
+        .unwrap()
+        .finish()
+        .unwrap();
+    wallet_nt.sign(&signer_nt, &mut pset);
+    wallet_nt.send(&mut pset);
+    wallet_a.sync();
+    assert_eq!(wallet_nt.balance(token), satoshi_t);
+    assert_eq!(wallet_a.balance(asset), satoshi_a + satoshi_ar * 2);
 }
 
 #[test]
@@ -615,7 +671,7 @@ fn create_pset_error() {
 
     let err = wallet
         .tx_builder()
-        .reissue_asset(asset, satoshi_a, None)
+        .reissue_asset(asset, satoshi_a, None, None)
         .unwrap()
         .finish()
         .unwrap_err();
@@ -626,7 +682,18 @@ fn create_pset_error() {
     // so it can't reissue the asset.
     let err = wallet2
         .tx_builder()
-        .reissue_asset(asset, satoshi_a, None)
+        .reissue_asset(asset, satoshi_a, None, None)
+        .unwrap()
+        .finish()
+        .unwrap_err();
+    assert_eq!(err.to_string(), Error::MissingIssuance.to_string());
+
+    // If you pass the issuance transaction it must contain the asset issuance
+    let tx_hex = include_str!("../tests/data/usdt-issuance-tx.hex");
+    let tx: Transaction = deserialize(&Vec::<u8>::from_hex(tx_hex).unwrap()).unwrap();
+    let err = wallet2
+        .tx_builder()
+        .reissue_asset(asset, satoshi_a, None, Some(tx))
         .unwrap()
         .finish()
         .unwrap_err();
@@ -812,4 +879,31 @@ fn wait_status_change(
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     panic!("status didn't change");
+}
+
+#[cfg(feature = "esplora_wasm")]
+#[tokio::test]
+async fn test_esplora_wasm_client() {
+    let server = setup(true);
+    let url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
+    let mut client = EsploraWasmClient::new(&url);
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let descriptor = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
+    let network = network_regtest();
+
+    let descriptor: WolletDescriptor = descriptor.parse().unwrap();
+
+    let mut wollet = Wollet::new(network, NoPersist::new(), descriptor).unwrap();
+
+    let update = client.full_scan(&wollet).await.unwrap().unwrap();
+    wollet.apply_update(update).unwrap();
+
+    let address = wollet.address(None).unwrap();
+    server.node_sendtoaddress(address.address(), 10000, None);
+
+    std::thread::sleep(std::time::Duration::from_millis(10_000)); // TODO should wait the tx properly
+
+    let update = client.full_scan(&wollet).await.unwrap().unwrap();
+    wollet.apply_update(update).unwrap();
 }

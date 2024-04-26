@@ -1,4 +1,3 @@
-Cargo.lock
 target*
 *swp
 bak*
@@ -10,3 +9,5 @@ lwk_bindings.kt
 flash_image.bin
 qemu_efuse.bin
 context/jade-emulator/Dockerfile
+.direnv
+result

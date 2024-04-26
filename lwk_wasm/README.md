@@ -38,6 +38,13 @@ To build the WASM library you need [rust](https://www.rust-lang.org/learn/get-st
 $ wasm-pack build --dev
 ```
 
+To enable web-serial:
+
+```shell
+$ RUSTFLAGS="--cfg=web_sys_unstable_apis" wasm-pack build --dev --features serial
+```
+
+
 Then follow the library consumer section.
 
 ### Test
@@ -54,14 +61,14 @@ To avoid requiring opening the browser the headless mode is possible.
 
 Note the increased timeout specified via the env var, the 20s default one could be too low.
 
-```
+```shell
 $ cd lwk_wasm
 $ WASM_BINDGEN_TEST_TIMEOUT=60 wasm-pack test --firefox --headless
 ```
 
 run specific test (note the double `--`)
 
-```
+```shell
 $ wasm-pack test --firefox --headless -- -- balance_test_testnet
 ```
 
@@ -71,7 +78,7 @@ Build rust crates in release mode, optimizing for space.
 
 ```shell
 $ cd lwk_wasm/
-$ CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build
+$ RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build --features serial
 ```
 
 ### Build wasm lib for profiling
@@ -81,12 +88,12 @@ as release but we want to keep debug info to analyze the produced lib with funct
 
 ```shell
 $ cd lwk_wasm/
-$ CARGO_PROFILE_RELEASE_OPT_LEVEL=z CARGO_PROFILE_RELEASE_DEBUG=2 wasm-pack build --profiling
+$ RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z CARGO_PROFILE_RELEASE_DEBUG=2 wasm-pack build --profiling --features serial
 ```
 
 With [twiggy](https://github.com/rustwasm/twiggy) is then possible to analyze the library:
 
-```
+```shell
 twiggy top -n 10 pkg/lwk_wasm_bg.wasm
 ```
 

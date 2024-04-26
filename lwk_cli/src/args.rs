@@ -182,6 +182,7 @@ pub enum SignerSubCommandsEnum {
     LoadJade,
     LoadExternal,
     Unload,
+    Details,
     List,
     Sign,
     SinglesigDesc,
@@ -257,6 +258,15 @@ pub enum SignerCommand {
 
         #[arg(long)]
         mnemonic: String, // TODO is it right to have the mnemonic as arg?
+
+        /// Specify if the rpc-server should persist the signer
+        ///
+        /// If true, the mnemonic is persisted to disk, but will be available at following restarts.
+        ///
+        /// If false, nothing is persisted, but at following restarts this signer will not be
+        /// availabled.
+        #[arg(long, required(true))]
+        persist: Option<bool>,
     },
 
     /// Load a Jade signer giving it a name
@@ -280,6 +290,12 @@ pub enum SignerCommand {
 
         #[arg(long)]
         fingerprint: String,
+    },
+
+    /// Details of a signer
+    Details {
+        #[arg(short, long, env)]
+        signer: String,
     },
 
     /// Unload a software signer
@@ -415,6 +431,7 @@ pub enum WalletCommand {
         #[arg(short, long, env)]
         wallet: String,
 
+        /// The derivation index of the address
         #[arg(long)]
         index: Option<u32>,
 
@@ -423,6 +440,15 @@ pub enum WalletCommand {
         /// Display the address on hardware signers.
         #[arg(short, long, env)]
         signer: Option<String>,
+
+        /// Returns a text-encoded qr in the json
+        #[arg(long)]
+        with_text_qr: bool,
+
+        /// Returns a qr image in the json,
+        /// the given number is the number of pixel per qr code module
+        #[arg(long)]
+        with_uri_qr: Option<u8>,
     },
 
     /// Get the balance of the given wallet name
@@ -515,6 +541,26 @@ pub enum WalletCommand {
         fee_rate: Option<f32>,
     },
 
+    /// Burn an asset
+    Burn {
+        /// Wallet name
+        #[arg(short, long, env)]
+        wallet: String,
+
+        /// The asset to burn
+        #[arg(long)]
+        asset: String,
+
+        /// The number of units of the asset to burn
+        #[arg(long)]
+        satoshi_asset: u64,
+
+        // TODO default value
+        /// To optionally specify a fee
+        #[arg(long)]
+        fee_rate: Option<f32>,
+    },
+
     /// Print a multisig descriptor
     MultisigDesc {
         #[arg(long)]
@@ -595,6 +641,21 @@ pub enum WalletCommand {
         /// Replace asset ids with tickers when possible
         #[arg(long, action)]
         with_tickers: bool,
+    },
+
+    /// Get a transaction
+    Tx {
+        /// Wallet name
+        #[arg(short, long, env)]
+        wallet: String,
+
+        /// Transaction ID
+        #[arg(short, long)]
+        txid: String,
+
+        /// Use the explorer if necessary
+        #[arg(long, action)]
+        from_explorer: bool,
     },
 
     /// Set a wallet tx memo
@@ -684,25 +745,29 @@ pub enum AssetCommand {
         ///
         /// You can fetch it from the asset registry from
         /// `https://assets.blockstream.info/<ASSET-ID-HEX>`
-        /// alongside the issuenace prevout.
+        /// alongside the issuance prevout.
         #[arg(long)]
         contract: String,
 
-        /// Issuance prevout txid
+        /// The issuance transaction in hex
+        ///
+        /// You can fetch it from your node or from a block explorer,
+        /// e.g. `https://blockstream.info/liquid/api/<TXID>/hex`
         #[arg(long)]
-        prev_txid: String,
-
-        /// Issuance prevout vout
-        #[arg(long)]
-        prev_vout: u32,
-
-        /// Whether the issuance was blinded or not
-        #[arg(long, default_value_t = false)]
-        is_confidential: bool,
+        issuance_tx: String,
     },
 
     /// Remove an asset
     Remove {
+        /// Asset ID in hex
+        #[arg(short, long)]
+        asset: String,
+    },
+
+    /// Insert an asset getting data from the block explorer
+    ///
+    /// This is worse from a privacy perspective.
+    FromExplorer {
         /// Asset ID in hex
         #[arg(short, long)]
         asset: String,
@@ -734,6 +799,15 @@ pub enum ServerCommand {
         /// Electrum URL, if not specified a reasonable default is used according to the network
         #[arg(short, long)]
         electrum_url: Option<String>,
+
+        #[arg(long)]
+        #[cfg(feature = "registry")]
+        /// Needed only in regtest because public network have their official defaults
+        registry_url: Option<String>,
+
+        #[arg(long)]
+        /// Esplora API URL, if not specified a reasonable default is used according to the network
+        esplora_api_url: Option<String>,
 
         /// Location for logs, server state, and other LWK data
         ///

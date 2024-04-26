@@ -21,8 +21,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lwk_common::{
-    keyorigin_xpub_from_str, multisig_desc, singlesig_desc, InvalidBipVariant,
-    InvalidBlindingKeyVariant, InvalidMultisigVariant, InvalidSinglesigVariant, Signer,
+    address_to_text_qr, address_to_uri_qr, keyorigin_xpub_from_str, multisig_desc, singlesig_desc,
+    InvalidBipVariant, InvalidBlindingKeyVariant, InvalidMultisigVariant, InvalidSinglesigVariant,
+    Signer,
 };
 use lwk_jade::derivation_path_to_vec;
 use lwk_jade::get_receive_address::Variant;
@@ -32,6 +33,7 @@ use lwk_signer::{AnySigner, SwSigner};
 use lwk_tiny_jrpc::{tiny_http, JsonRpcServer, Request, Response};
 use lwk_wollet::bitcoin::bip32::Fingerprint;
 use lwk_wollet::bitcoin::XKeyIdentifier;
+use lwk_wollet::elements::encode::serialize;
 use lwk_wollet::elements::hex::{FromHex, ToHex};
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::elements::{Address, AssetId, Txid};
@@ -41,8 +43,8 @@ use lwk_wollet::elements_miniscript::{DescriptorPublicKey, ForEachKey};
 use lwk_wollet::{full_scan_with_electrum_client, Wollet};
 use lwk_wollet::{BlockchainBackend, WolletDescriptor};
 use serde_json::Value;
-use state::id_to_fingerprint;
 
+use crate::explorer::{get_registry_data, get_tx};
 use crate::method::Method;
 use crate::state::{AppAsset, AppSigner, State};
 use lwk_rpc_model::{request, response};
@@ -56,7 +58,9 @@ mod client;
 mod config;
 pub mod consts;
 mod error;
+mod explorer;
 pub mod method;
+mod reqwest_transport;
 mod state;
 
 pub struct App {
@@ -82,6 +86,13 @@ impl App {
         })
     }
 
+    fn apply_request(&self, client: &Client, line: &str) -> Result<(), Error> {
+        let r: Request = serde_json::from_str(line)?;
+        let method: Method = r.method.parse()?;
+        let _value: Value = client.make_request(method, r.params)?;
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), Error> {
         if self.rpc.is_some() {
             return Err(error::Error::AlreadyStarted);
@@ -100,7 +111,8 @@ impl App {
         };
         state.insert_policy_asset();
         let state = Arc::new(Mutex::new(state));
-        let server = tiny_http::Server::http(self.config.addr)?;
+        let server = tiny_http::Server::http(self.config.addr)
+            .map_err(|_| Error::ServerStart(self.config.addr.to_string()))?;
 
         // TODO, for some reasons, using the default number of threads (4) cause a request to be
         // replied after 15 seconds, using 1 instead seems to not have that issue.
@@ -119,10 +131,10 @@ impl App {
 
                 let client = self.client()?;
 
-                for line in string.lines() {
-                    let r: Request = serde_json::from_str(line)?;
-                    let method: Method = r.method.parse()?;
-                    let _value: Value = client.make_request(method, r.params)?;
+                for (n, line) in string.lines().enumerate() {
+                    self.apply_request(&client, line).map_err(|err| {
+                        Error::StartStateLoad(err.to_string(), n + 1, path.display().to_string())
+                    })?
                 }
             }
             Err(_) => {
@@ -243,11 +255,11 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let method: Method = r.method.parse()?;
             Response::result(request.id, method.schema(r.direction)?)
         }
-        Method::GenerateSigner => {
+        Method::SignerGenerate => {
             let (_signer, mnemonic) = SwSigner::random(state.lock()?.config.is_mainnet())?;
             Response::result(
                 request.id,
-                serde_json::to_value(response::GenerateSigner {
+                serde_json::to_value(response::SignerGenerate {
                     mnemonic: mnemonic.to_string(),
                 })?,
             )
@@ -262,8 +274,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::LoadWallet => {
-            let r: request::LoadWallet = serde_json::from_value(params)?;
+        Method::WalletLoad => {
+            let r: request::WalletLoad = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             // TODO recognize different name same descriptor?
 
@@ -281,8 +293,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::UnloadWallet => {
-            let r: request::UnloadWallet = serde_json::from_value(params)?;
+        Method::WalletUnload => {
+            let r: request::WalletUnload = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let removed = s.wollets.remove(&r.name)?;
             s.tx_memos.remove(&r.name);
@@ -291,7 +303,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
 
             Response::result(
                 request.id,
-                serde_json::to_value(response::UnloadWallet {
+                serde_json::to_value(response::WalletUnload {
                     unloaded: response::Wallet {
                         name: r.name,
                         descriptor: removed.descriptor().to_string(),
@@ -299,7 +311,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::ListWallets => {
+        Method::WalletList => {
             let s = state.lock()?;
             let wallets = s
                 .wollets
@@ -309,35 +321,25 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                     name: name.clone(),
                 })
                 .collect();
-            let r = response::ListWallets { wallets };
+            let r = response::WalletList { wallets };
             Response::result(request.id, serde_json::to_value(r)?)
         }
         Method::SignerLoadSoftware => {
             let r: request::SignerLoadSoftware = serde_json::from_value(params)?;
             let mut s = state.lock()?;
-            let mnemonic = r.mnemonic;
-
-            let signer = AppSigner::AvailableSigner(AnySigner::Software(SwSigner::new(
-                &mnemonic,
-                s.config.is_mainnet(),
-            )?));
+            let signer = AppSigner::new_sw(&r.mnemonic, s.config.is_mainnet(), r.persist)?;
             let resp: response::Signer = signer_response_from(&r.name, &signer)?;
             s.signers.insert(&r.name, signer)?;
-            s.persist(&request)?;
+            if r.persist {
+                s.persist(&request)?;
+            }
             Response::result(request.id, serde_json::to_value(resp)?)
         }
         Method::SignerLoadJade => {
             let r: request::SignerLoadJade = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let id = XKeyIdentifier::from_str(&r.id).map_err(|e| e.to_string())?; // TODO remove map_err
-            let signer = match r.emulator {
-                Some(socket) => {
-                    // The emulator is meant to be used only in testing, we don't aim to handle connection/disconnection
-                    let jade = Jade::from_socket(socket, s.config.jade_network())?;
-                    AppSigner::AvailableSigner(AnySigner::Jade(jade, id))
-                }
-                None => AppSigner::JadeId(id, s.config.jade_network()),
-            };
+            let signer = AppSigner::new_jade(id, r.emulator, s.config.jade_network())?;
             let resp: response::Signer = signer_response_from(&r.name, &signer)?;
             s.signers.insert(&r.name, signer)?;
             s.persist(&request)?;
@@ -348,24 +350,31 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let mut s = state.lock()?;
             let fingerprint =
                 Fingerprint::from_str(&r.fingerprint).map_err(|e| Error::Generic(e.to_string()))?;
-            let signer = AppSigner::ExternalSigner(fingerprint);
+            let signer = AppSigner::new_external(fingerprint);
             let resp: response::Signer = signer_response_from(&r.name, &signer)?;
             s.signers.insert(&r.name, signer)?;
             s.persist(&request)?;
             Response::result(request.id, serde_json::to_value(resp)?)
         }
-        Method::UnloadSigner => {
-            let r: request::UnloadSigner = serde_json::from_value(params)?;
+        Method::SignerUnload => {
+            let r: request::SignerUnload = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let removed = s.signers.remove(&r.name)?;
             let signer: response::Signer = signer_response_from(&r.name, &removed)?;
             s.persist_all()?;
             Response::result(
                 request.id,
-                serde_json::to_value(response::UnloadSigner { unloaded: signer })?,
+                serde_json::to_value(response::SignerUnload { unloaded: signer })?,
             )
         }
-        Method::ListSigners => {
+        Method::SignerDetails => {
+            let r: request::SignerDetails = serde_json::from_value(params)?;
+            let s = state.lock()?;
+            let signer = s.signers.get(&r.name)?;
+            let details = signer_details(&r.name, signer)?;
+            Response::result(request.id, serde_json::to_value(details)?)
+        }
+        Method::SignerList => {
             let s = state.lock()?;
             let signers: Result<Vec<_>, _> = s
                 .signers
@@ -374,11 +383,11 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .collect();
             let mut signers = signers?;
             signers.sort();
-            let r = response::ListSigners { signers };
+            let r = response::SignerList { signers };
             Response::result(request.id, serde_json::to_value(r)?)
         }
-        Method::Address => {
-            let r: request::Address = serde_json::from_value(params)?;
+        Method::WalletAddress => {
+            let r: request::WalletAddress = serde_json::from_value(params)?;
             let mut s = state.lock()?;
 
             let wollet = s.wollets.get_mut(&r.name)?;
@@ -386,6 +395,18 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let definite_desc = wollet
                 .wollet_descriptor()
                 .definite_descriptor(lwk_wollet::Chain::External, addr.index())?;
+
+            let text_qr = r
+                .with_text_qr
+                .then(|| address_to_text_qr(addr.address()))
+                .transpose()?;
+            let uri_qr = r
+                .with_uri_qr
+                .map(|e| {
+                    let pixel_per_module = (e != 0).then_some(e);
+                    address_to_uri_qr(addr.address(), pixel_per_module)
+                })
+                .transpose()?;
 
             if let Some(signer) = r.signer {
                 let signer = s.get_available_signer(&signer)?;
@@ -451,15 +472,17 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let memo = memos.get(address).cloned().unwrap_or_default();
             Response::result(
                 request.id,
-                serde_json::to_value(response::Address {
+                serde_json::to_value(response::WalletAddress {
                     address: address.to_string(),
                     index: addr.index(),
                     memo,
+                    text_qr,
+                    uri_qr,
                 })?,
             )
         }
-        Method::Balance => {
-            let r: request::Balance = serde_json::from_value(params)?;
+        Method::WalletBalance => {
+            let r: request::WalletBalance = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let wollet = s.wollets.get_mut(&r.name)?;
             let mut balance = wollet
@@ -472,11 +495,11 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             }
             Response::result(
                 request.id,
-                serde_json::to_value(response::Balance { balance })?,
+                serde_json::to_value(response::WalletBalance { balance })?,
             )
         }
-        Method::SendMany => {
-            let r: request::Send = serde_json::from_value(params)?;
+        Method::WalletSendMany => {
+            let r: request::WalletSendMany = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let wollet: &mut Wollet = s.wollets.get_mut(&r.name)?;
 
@@ -499,8 +522,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::SinglesigDescriptor => {
-            let r: request::SinglesigDescriptor = serde_json::from_value(params)?;
+        Method::SignerSinglesigDescriptor => {
+            let r: request::SignerSinglesigDescriptor = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let is_mainnet = s.config.is_mainnet();
 
@@ -519,11 +542,11 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let descriptor = singlesig_desc(signer, script_variant, blinding_variant, is_mainnet)?;
             Response::result(
                 request.id,
-                serde_json::to_value(response::SinglesigDescriptor { descriptor })?,
+                serde_json::to_value(response::SignerSinglesigDescriptor { descriptor })?,
             )
         }
-        Method::MultisigDescriptor => {
-            let r: request::MultisigDescriptor = serde_json::from_value(params)?;
+        Method::WalletMultisigDescriptor => {
+            let r: request::WalletMultisigDescriptor = serde_json::from_value(params)?;
 
             let multisig_variant = r
                 .multisig_kind
@@ -551,11 +574,11 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             )?;
             Response::result(
                 request.id,
-                serde_json::to_value(response::MultisigDescriptor { descriptor })?,
+                serde_json::to_value(response::WalletMultisigDescriptor { descriptor })?,
             )
         }
-        Method::RegisterMultisig => {
-            let r: request::RegisterMultisig = serde_json::from_value(params)?;
+        Method::SignerRegisterMultisig => {
+            let r: request::SignerRegisterMultisig = serde_json::from_value(params)?;
             let mut s = state.lock()?;
 
             let network = s.config.jade_network();
@@ -572,8 +595,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             }
             Response::result(request.id, serde_json::to_value(response::Empty {})?)
         }
-        Method::Xpub => {
-            let r: request::Xpub = serde_json::from_value(params)?;
+        Method::SignerXpub => {
+            let r: request::SignerXpub = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let is_mainnet = s.config.is_mainnet();
 
@@ -587,11 +610,11 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let keyorigin_xpub = signer.keyorigin_xpub(bip, is_mainnet)?;
             Response::result(
                 request.id,
-                serde_json::to_value(response::Xpub { keyorigin_xpub })?,
+                serde_json::to_value(response::SignerXpub { keyorigin_xpub })?,
             )
         }
-        Method::Sign => {
-            let r: request::Sign = serde_json::from_value(params)?;
+        Method::SignerSign => {
+            let r: request::SignerSign = serde_json::from_value(params)?;
             let mut s = state.lock()?;
 
             let signer = s.get_available_signer(&r.name)?;
@@ -610,8 +633,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::Broadcast => {
-            let r: request::Broadcast = serde_json::from_value(params)?;
+        Method::WalletBroadcast => {
+            let r: request::WalletBroadcast = serde_json::from_value(params)?;
             let mut s = state.lock()?;
 
             let wollet = s.wollets.get_mut(&r.name)?;
@@ -626,7 +649,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
 
             Response::result(
                 request.id,
-                serde_json::to_value(response::Broadcast {
+                serde_json::to_value(response::WalletBroadcast {
                     txid: tx.txid().to_string(),
                 })?,
             )
@@ -669,7 +692,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .iter()
                 .map(|fingerprint| {
                     let name = s.signers.name_from_fingerprint(fingerprint, &mut warnings);
-                    response::SignerDetails {
+                    response::SignerShortDetails {
                         name,
                         fingerprint: fingerprint.to_string(),
                     }
@@ -714,7 +737,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let has_signatures_from = details
                 .fingerprints_has()
                 .iter()
-                .map(|f| response::SignerDetails {
+                .map(|f| response::SignerShortDetails {
                     name: s.signers.name_from_fingerprint(f, &mut warnings),
                     fingerprint: f.to_string(),
                 })
@@ -722,7 +745,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let missing_signatures_from = details
                 .fingerprints_missing()
                 .iter()
-                .map(|f| response::SignerDetails {
+                .map(|f| response::SignerShortDetails {
                     name: s.signers.name_from_fingerprint(f, &mut warnings),
                     fingerprint: f.to_string(),
                 })
@@ -810,6 +833,21 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 serde_json::to_value(response::WalletTxs { txs })?,
             )
         }
+        Method::WalletTx => {
+            let r: request::WalletTx = serde_json::from_value(params)?;
+            let mut s = state.lock()?;
+            let wollet = s.wollets.get_mut(&r.name)?;
+            let txid = Txid::from_str(&r.txid)?;
+            let tx = if let Some(tx) = wollet.transaction(&txid)? {
+                tx.tx.clone()
+            } else if r.from_explorer {
+                get_tx(&s.config.esplora_api_url, &txid)?
+            } else {
+                return Err(Error::WalletTxNotFound(r.txid, r.name));
+            };
+            let tx = serialize(&tx).to_hex();
+            Response::result(request.id, serde_json::to_value(response::WalletTx { tx })?)
+        }
         Method::WalletSetTxMemo => {
             let r: request::WalletSetTxMemo = serde_json::from_value(params)?;
             let mut s = state.lock()?;
@@ -832,8 +870,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             s.persist(&request)?;
             Response::result(request.id, serde_json::to_value(response::Empty {})?)
         }
-        Method::Issue => {
-            let r: request::Issue = serde_json::from_value(params)?;
+        Method::WalletIssue => {
+            let r: request::WalletIssue = serde_json::from_value(params)?;
             let mut s = state.lock()?;
             let wollet = s.wollets.get_mut(&r.name)?;
             let tx = wollet
@@ -856,17 +894,20 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::Reissue => {
-            let r: request::Reissue = serde_json::from_value(params)?;
+        Method::WalletReissue => {
+            let r: request::WalletReissue = serde_json::from_value(params)?;
             let mut s = state.lock()?;
+            let asset_id = AssetId::from_str(&r.asset)?;
+            let issuance_tx = s.get_issuance_tx(&asset_id);
             let wollet = s.wollets.get_mut(&r.name)?;
 
             let mut pset = wollet
                 .tx_builder()
                 .reissue_asset(
-                    AssetId::from_str(&r.asset)?,
+                    asset_id,
                     r.satoshi_asset,
                     r.address_asset.map(|a| Address::from_str(&a)).transpose()?,
+                    issuance_tx,
                 )?
                 .fee_rate(r.fee_rate)
                 .finish()?;
@@ -879,8 +920,28 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::Contract => {
-            let r: request::Contract = serde_json::from_value(params)?;
+        Method::WalletBurn => {
+            let r: request::WalletBurn = serde_json::from_value(params)?;
+            let mut s = state.lock()?;
+            let asset_id = AssetId::from_str(&r.asset)?;
+            let wollet = s.wollets.get_mut(&r.name)?;
+
+            let mut pset = wollet
+                .tx_builder()
+                .add_burn(r.satoshi_asset, asset_id)?
+                .fee_rate(r.fee_rate)
+                .finish()?;
+
+            add_contracts(&mut pset, s.assets.iter());
+            Response::result(
+                request.id,
+                serde_json::to_value(response::Pset {
+                    pset: pset.to_string(),
+                })?,
+            )
+        }
+        Method::AssetContract => {
+            let r: request::AssetContract = serde_json::from_value(params)?;
             let c = lwk_wollet::Contract {
                 entity: lwk_wollet::Entity::Domain(r.domain),
                 issuer_pubkey: Vec::<u8>::from_hex(&r.issuer_pubkey)?,
@@ -907,7 +968,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })?,
             )
         }
-        Method::ListAssets => {
+        Method::AssetList => {
             let s = state.lock()?;
             let mut assets: Vec<_> = s
                 .assets
@@ -918,7 +979,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 })
                 .collect();
             assets.sort();
-            let r = response::ListAssets { assets };
+            let r = response::AssetList { assets };
             Response::result(request.id, serde_json::to_value(r)?)
         }
         Method::AssetInsert => {
@@ -926,17 +987,13 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let mut s = state.lock()?;
             let asset_id = lwk_wollet::elements::AssetId::from_str(&r.asset_id)
                 .map_err(|e| Error::Generic(e.to_string()))?;
-            let prev_txid = lwk_wollet::elements::Txid::from_str(&r.prev_txid)
+            let issuance_tx =
+                Vec::<u8>::from_hex(&r.issuance_tx).map_err(|e| Error::Generic(e.to_string()))?;
+            let issuance_tx = lwk_wollet::elements::encode::deserialize(&issuance_tx)
                 .map_err(|e| Error::Generic(e.to_string()))?;
             let contract = serde_json::Value::from_str(&r.contract)?;
             let contract = lwk_wollet::Contract::from_value(&contract)?;
-            s.insert_asset(
-                asset_id,
-                prev_txid,
-                r.prev_vout,
-                contract,
-                r.is_confidential,
-            )?;
+            s.insert_asset(asset_id, issuance_tx, contract)?;
             s.persist(&request)?;
             Response::result(request.id, serde_json::to_value(response::Empty {})?)
         }
@@ -947,6 +1004,22 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .map_err(|e| Error::Generic(e.to_string()))?;
             s.remove_asset(&asset_id)?;
             s.persist_all()?;
+            Response::result(request.id, serde_json::to_value(response::Empty {})?)
+        }
+        Method::AssetFromExplorer => {
+            let r: request::AssetFromExplorer = serde_json::from_value(params)?;
+            let mut s = state.lock()?;
+            let asset_id = AssetId::from_str(&r.asset_id)?;
+            if s.get_asset(&asset_id).is_ok() {
+                return Err(Error::AssetAlreadyInserted(r.asset_id));
+            }
+            let registry_data = get_registry_data(&s.config.registry_url, &asset_id)?;
+            let txid = Txid::from_str(&registry_data.issuance_txin.txid)?;
+            let issuance_tx = get_tx(&s.config.esplora_api_url, &txid)?;
+            s.insert_asset(asset_id, issuance_tx, registry_data.contract)?;
+            // convert the request to an AssetInsert to skip network calls
+            let asset_insert_request = s.get_asset(&asset_id)?.request().expect("asset");
+            s.persist(&asset_insert_request)?;
             Response::result(request.id, serde_json::to_value(response::Empty {})?)
         }
         Method::SignerJadeId => {
@@ -960,6 +1033,12 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
 
             let jade = match r.emulator {
                 Some(emulator) => Jade::from_socket(emulator, network)?,
+                #[cfg(not(feature = "serial"))]
+                None => {
+                    let _timeout = timeout;
+                    return Err(Error::FeatSerialDisabled);
+                }
+                #[cfg(feature = "serial")]
                 None => {
                     // TODO instead of the first working, we should return all the available jades with the port currently connected on
                     let mut jade = Jade::from_any_serial(network, timeout)
@@ -992,17 +1071,10 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let asset = s.get_asset(&asset_id)?;
             if let AppAsset::RegistryAsset(asset) = asset {
                 let client = reqwest::blocking::Client::new();
-                let url = match s.config.network {
-                    lwk_wollet::ElementsNetwork::Liquid => "https://assets.blockstream.info",
-                    lwk_wollet::ElementsNetwork::LiquidTestnet => {
-                        "https://assets-testnet.blockstream.info/"
-                    }
-                    lwk_wollet::ElementsNetwork::ElementsRegtest { .. } => {
-                        return Err(Error::Generic("Can't publish on regtest".to_string()));
-                    }
-                };
+                let url = &s.config.registry_url;
                 let contract = asset.contract();
                 let data = serde_json::json!({"asset_id": asset_id, "contract": contract});
+                tracing::debug!("posting {data:?} as json to {url} ");
                 let response = client.post(url).json(&data).send()?;
                 let mut result = response.text()?;
                 if result.contains("failed verifying linked entity") {
@@ -1054,25 +1126,21 @@ fn unvalidated_addressee(a: request::UnvalidatedAddressee) -> lwk_wollet::Unvali
     }
 }
 
-fn signer_response_from(
-    name: &str,
-    signer: &AppSigner,
-) -> Result<response::Signer, lwk_signer::SignerError> {
-    let (fingerprint, id, xpub) = match signer {
-        AppSigner::AvailableSigner(signer) => (
-            signer.fingerprint()?,
-            Some(signer.identifier()?),
-            Some(signer.xpub()?),
-        ),
-        AppSigner::ExternalSigner(fingerprint) => (*fingerprint, None, None),
-        AppSigner::JadeId(id, _) => (id_to_fingerprint(id), Some(*id), None),
-    };
-
+fn signer_response_from(name: &str, signer: &AppSigner) -> Result<response::Signer, Error> {
     Ok(response::Signer {
         name: name.to_string(),
-        id: id.map(|i| i.to_string()),
-        fingerprint: fingerprint.to_string(),
-        xpub: xpub.map(|x| x.to_string()),
+        fingerprint: signer.fingerprint()?.to_string(),
+    })
+}
+
+fn signer_details(name: &str, signer: &AppSigner) -> Result<response::SignerDetails, Error> {
+    Ok(response::SignerDetails {
+        name: name.to_string(),
+        id: signer.id()?.map(|i| i.to_string()),
+        fingerprint: signer.fingerprint()?.to_string(),
+        xpub: signer.xpub()?.map(|x| x.to_string()),
+        mnemonic: signer.mnemonic(),
+        type_: signer.type_(),
     })
 }
 

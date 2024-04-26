@@ -29,14 +29,14 @@ pub enum Error {
     #[error("HexArray Error: {0}")]
     HexArray(#[from] lwk_wollet::hashes::hex::HexToArrayError),
 
-    #[error("Minreq Error: {0}")]
-    Minreq(#[from] jsonrpc::minreq_http::Error),
-
     #[error("Reqwest Error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
     #[error("Hex Error: {0}")]
     Hex(lwk_wollet::elements::hex::Error),
+
+    #[error("Elements Encode Error: {0}")]
+    ElementsEncode(lwk_wollet::elements::encode::Error),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -59,11 +59,17 @@ pub enum Error {
     #[error("Signer Error: {0}")]
     Signer(#[from] lwk_signer::SignerError),
 
+    #[error(transparent)]
+    QrError(#[from] lwk_common::QrError),
+
     #[error("Wallet '{0}' does not exist")]
     WalletNotExist(String),
 
     #[error("Wallet '{0}' is already loaded")]
     WalletAlreadyLoaded(String),
+
+    #[error("Tx '{0}' was not found in wallet '{1}'")]
+    WalletTxNotFound(String, String),
 
     #[error("Signer '{0}' does not exist")]
     SignerNotExist(String),
@@ -74,14 +80,29 @@ pub enum Error {
     #[error("Asset '{0}' does not exist")]
     AssetNotExist(String),
 
+    #[error("Given transaction does not contain issuance of asset '{0}'")]
+    InvalidIssuanceTxtForAsset(String),
+
     #[error("Given contract does not commit to asset '{0}'")]
     InvalidContractForAsset(String),
+
+    #[error("Asset '{0}' already inserted")]
+    AssetAlreadyInserted(String),
 
     #[error(transparent)]
     MethodNotExist(#[from] crate::method::MethodNotExist),
 
     #[error("Poison error: {0}")]
     PoisonError(String),
+
+    #[error("Feature \"serial\" is disabled, enable it to solve this error")]
+    FeatSerialDisabled,
+
+    #[error("Cannot start the server at \"{0}\". It is probably already running.")]
+    ServerStart(String),
+
+    #[error("Error re-applying start request\nError {0}\nAt line {1} from file {2}\nConsider: (a) correct the line (b) remove the line (c) remove the file")]
+    StartStateLoad(String, usize, String),
 
     #[error("Received stop command")]
     Stop,
@@ -130,6 +151,11 @@ impl From<String> for Error {
 impl From<lwk_wollet::elements::hex::Error> for Error {
     fn from(value: lwk_wollet::elements::hex::Error) -> Self {
         Error::Hex(value)
+    }
+}
+impl From<lwk_wollet::elements::encode::Error> for Error {
+    fn from(value: lwk_wollet::elements::encode::Error) -> Self {
+        Error::ElementsEncode(value)
     }
 }
 

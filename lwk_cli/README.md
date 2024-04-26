@@ -9,6 +9,11 @@ $ cargo build --release
 $ alias cli="$(pwd)/target/release/lwk_cli"
 ```
 
+If you want to enable Jade over serial build with
+```sh
+$ cargo build --release --features serial
+```
+
 Help shows available commands:
 
 ```sh
@@ -69,7 +74,7 @@ $ cli signer generate
 is equivalent to:
 
 ```sh
-$ curl --header "Content-Type: application/json" --request POST --data '{"method":"generate_signer","params":[],"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s
+$ curl --header "Content-Type: application/json" --request POST --data '{"method":"signer_generate","params":[],"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s
 ```
 
 To see RPC data exchanged via the cli commands enable app log tracing eg:
@@ -100,7 +105,7 @@ $ cli wallet balance --wallet custody
 is equivalent to:
 
 ```sh
-$ curl --header "Content-Type: application/json" --request POST --data '{"method":"load_wallet","params":{"descriptor":"ct(L3jXxwef3fpB7hcrFozcWgHeJCPSAFiZ1Ji2YJMPxceaGvy3PC1q,elwpkh(tpubD6NzVbkrYhZ4Was8nwnZi7eiWUNJq2LFpPSCMQLioUfUtT1e72GkRbmVeRAZc26j5MRUz2hRLsaVHJfs6L7ppNfLUrm9btQTuaEsLrT7D87/*))#lrwadl63", "name": "custody"},"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s
+$ curl --header "Content-Type: application/json" --request POST --data '{"method":"wallet_load","params":{"descriptor":"ct(L3jXxwef3fpB7hcrFozcWgHeJCPSAFiZ1Ji2YJMPxceaGvy3PC1q,elwpkh(tpubD6NzVbkrYhZ4Was8nwnZi7eiWUNJq2LFpPSCMQLioUfUtT1e72GkRbmVeRAZc26j5MRUz2hRLsaVHJfs6L7ppNfLUrm9btQTuaEsLrT7D87/*))#lrwadl63", "name": "custody"},"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s
 
 $ curl --header "Content-Type: application/json" --request POST --data '{"method":"balance","params":{"name":"custody"},"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s | jq .result
 ```
@@ -115,7 +120,7 @@ $ cli wallet address --wallet custody --index 4
 An error test case:
 
 ```sh
-$ curl --header "Content-Type: application/json" --request POST --data '{"method":"load_wallet","params":{"desc":"fake"},"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s | jq
+$ curl --header "Content-Type: application/json" --request POST --data '{"method":"wallet_load","params":{"desc":"fake"},"id":1,"jsonrpc":"2.0"}' http://localhost:32111 -s | jq
 {
   "jsonrpc": "2.0",
   "id": 1,
@@ -136,7 +141,7 @@ cli --network testnet server start
 
 ```sh
 $ MNEMONIC=$(cli signer generate | jq -r .mnemonic)
-$ cli signer load-software --mnemonic "$MNEMONIC" --signer s1
+$ cli signer load-software --persist true --mnemonic "$MNEMONIC" --signer s1
 $ DESCRIPTOR=$(cli signer singlesig-desc --signer s1 --descriptor-blinding-key slip77 --kind wpkh | jq -r .descriptor)
 $ cli wallet load --wallet w1 -d "$DESCRIPTOR"
 $ cli wallet address --wallet w1

@@ -35,7 +35,7 @@ pub enum Direction {
 
 /// Request to load a wallet in the server, returning [`response::Wallet`]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct LoadWallet {
+pub struct WalletLoad {
     /// The read-only descriptor describing the wallet outputs
     pub descriptor: String,
 
@@ -45,7 +45,7 @@ pub struct LoadWallet {
 
 /// Unload the wallet identified by the given name
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct UnloadWallet {
+pub struct WalletUnload {
     /// The name given to the wallet
     pub name: String,
 }
@@ -58,6 +58,9 @@ pub struct SignerLoadSoftware {
 
     /// The mnemonic (12 or 24 words)
     pub mnemonic: String,
+
+    /// Whether to persist the software signer
+    pub persist: bool,
 }
 
 /// Load a signer in the server
@@ -83,16 +86,23 @@ pub struct SignerLoadExternal {
     pub fingerprint: String,
 }
 
+/// Get the signer details
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SignerDetails {
+    /// The name of the signer
+    pub name: String,
+}
+
 /// Unload the signer identified by the given name
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct UnloadSigner {
+pub struct SignerUnload {
     /// The name of the signer
     pub name: String,
 }
 
 /// Request a receiving address
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Address {
+pub struct WalletAddress {
     /// The wallet name
     pub name: String,
 
@@ -101,11 +111,17 @@ pub struct Address {
 
     /// The signer name
     pub signer: Option<String>,
+
+    /// Whether to return a QR code of the address encoded as text
+    pub with_text_qr: bool,
+
+    /// Return a image QR code encoded as uri with the given pixel per module
+    pub with_uri_qr: Option<u8>,
 }
 
 /// The balance of a wallet
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Balance {
+pub struct WalletBalance {
     /// The wallet name
     pub name: String,
 
@@ -115,14 +131,14 @@ pub struct Balance {
 
 /// Send a transaction from a wallet
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Send {
+pub struct WalletSendMany {
     /// The wallet name creating the transaction
     pub name: String,
 
     /// Recipient addressees
     pub addressees: Vec<UnvalidatedAddressee>,
 
-    /// Optiona fee rate in sat/vb
+    /// Optional fee rate in sat/vb
     pub fee_rate: Option<f32>,
 }
 
@@ -145,7 +161,7 @@ pub struct UnvalidatedAddressee {
 
 /// A request containing information to create a single signature descriptor wallet
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SinglesigDescriptor {
+pub struct SignerSinglesigDescriptor {
     /// The signer name
     pub name: String,
 
@@ -158,7 +174,7 @@ pub struct SinglesigDescriptor {
 
 /// A request containing information to create a multi signature descriptor wallet
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct MultisigDescriptor {
+pub struct WalletMultisigDescriptor {
     /// The descriptor blinding key
     pub descriptor_blinding_key: String,
 
@@ -174,7 +190,7 @@ pub struct MultisigDescriptor {
 
 /// Request to register a multisig wallet on a signer
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct RegisterMultisig {
+pub struct SignerRegisterMultisig {
     /// The signer name
     pub name: String,
 
@@ -184,7 +200,7 @@ pub struct RegisterMultisig {
 
 /// Request to a signer for a derived xpub
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Xpub {
+pub struct SignerXpub {
     /// The signer name
     pub name: String,
 
@@ -194,7 +210,7 @@ pub struct Xpub {
 
 /// A request to sign a PSET
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Sign {
+pub struct SignerSign {
     /// The signer name
     pub name: String,
 
@@ -204,7 +220,7 @@ pub struct Sign {
 
 /// Request to broadcast a transaction
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Broadcast {
+pub struct WalletBroadcast {
     /// The wallet name
     pub name: String,
 
@@ -224,7 +240,7 @@ pub struct WalletDetails {
 
 /// Request to do an issuance
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Issue {
+pub struct WalletIssue {
     /// The wallet name doing the issuance
     pub name: String,
 
@@ -240,7 +256,7 @@ pub struct Issue {
     /// The address receiving the reissuance token, if missing a receiving address from the wallet doing the issuance is used
     pub address_token: Option<String>,
 
-    /// The contract defininig asset metadata, such as name, ticker and precision. See [`Contract`] request to create
+    /// The contract defininig asset metadata, such as name, ticker and precision. See [`AssetContract`] request to create
     pub contract: Option<String>,
 
     /// The optional fee rate
@@ -249,7 +265,7 @@ pub struct Issue {
 
 /// Request to do a reissuance
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Reissue {
+pub struct WalletReissue {
     /// The wallet name doing the reissuance
     pub name: String,
 
@@ -266,9 +282,25 @@ pub struct Reissue {
     pub fee_rate: Option<f32>,
 }
 
+/// Request to do burn an asset
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WalletBurn {
+    /// The wallet name
+    pub name: String,
+
+    /// The asset to burn
+    pub asset: String,
+
+    /// The number of units of the asset to burn
+    pub satoshi_asset: u64,
+
+    /// The optional fee rate
+    pub fee_rate: Option<f32>,
+}
+
 /// A request creating a contract in the JSON format expected by the issue call
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Contract {
+pub struct AssetContract {
     /// Domain of the issuer
     pub domain: String,
 
@@ -328,6 +360,19 @@ pub struct WalletTxs {
     pub with_tickers: bool,
 }
 
+/// Request to get a transaction
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WalletTx {
+    /// The wallet name
+    pub name: String,
+
+    /// Transaction ID
+    pub txid: String,
+
+    /// Use the explorer if necessary
+    pub from_explorer: bool,
+}
+
 /// Request to have details of an asset
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AssetDetails {
@@ -344,19 +389,20 @@ pub struct AssetInsert {
     /// Contract committed to the asset id
     pub contract: String,
 
-    /// Previous output txid corresponding to the issuance input
-    pub prev_txid: String,
-
-    /// Previous output vout corresponding to the issuance input
-    pub prev_vout: u32,
-
-    /// Whether the issuance was blinded or not
-    pub is_confidential: Option<bool>,
+    /// Issuance transaction in hex
+    pub issuance_tx: String,
 }
 
 /// Request to remove an asset
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AssetRemove {
+    /// The asset identifier
+    pub asset_id: String,
+}
+
+/// Request to insert an asset retrieving information from the explorer
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AssetFromExplorer {
     /// The asset identifier
     pub asset_id: String,
 }
@@ -409,9 +455,9 @@ mod test {
 
     #[test]
     fn test_json_schema() {
-        let schema = schema_for!(LoadWallet);
+        let schema = schema_for!(WalletLoad);
         assert_eq!(
-            r#"{"$schema":"http://json-schema.org/draft-07/schema#","title":"LoadWallet","description":"Request to load a wallet in the server, returning [`response::Wallet`]","type":"object","required":["descriptor","name"],"properties":{"descriptor":{"description":"The read-only descriptor describing the wallet outputs","type":"string"},"name":{"description":"The name given to the wallet, will be needed for calls related to the wallet","type":"string"}}}"#,
+            r#"{"$schema":"http://json-schema.org/draft-07/schema#","title":"WalletLoad","description":"Request to load a wallet in the server, returning [`response::Wallet`]","type":"object","required":["descriptor","name"],"properties":{"descriptor":{"description":"The read-only descriptor describing the wallet outputs","type":"string"},"name":{"description":"The name given to the wallet, will be needed for calls related to the wallet","type":"string"}}}"#,
             serde_json::to_string(&schema).unwrap()
         );
     }

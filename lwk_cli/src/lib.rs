@@ -79,6 +79,9 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
             match a.command {
                 ServerCommand::Start {
                     electrum_url,
+                    #[cfg(feature = "registry")]
+                    registry_url,
+                    esplora_api_url,
                     datadir,
                     timeout,
                     scanning_interval,
@@ -95,12 +98,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     let mut config = match args.network {
                         Network::Mainnet => Config::default_mainnet(datadir),
                         Network::Testnet => Config::default_testnet(datadir),
-                        Network::Regtest => Config::default_regtest(
-                            electrum_url.as_ref().ok_or_else(|| {
-                                anyhow!("on regtest you have to specify --electrum-url")
-                            })?,
-                            datadir,
-                        ),
+                        Network::Regtest => Config::default_regtest(datadir),
                     };
                     if let Some(timeout) = timeout {
                         config.timeout = Duration::from_secs(timeout);
@@ -110,16 +108,22 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     };
                     if let Some(url) = electrum_url {
                         config.electrum_url = url;
+                    } else if let Network::Regtest = args.network {
+                        anyhow::bail!("on regtest you have to specify --electrum-url");
                     };
+                    if let Some(url) = esplora_api_url {
+                        config.esplora_api_url = url;
+                    };
+
+                    #[cfg(feature = "registry")]
+                    if let Some(url) = registry_url {
+                        config.registry_url = url;
+                    };
+
                     config.addr = addr;
                     let mut app = lwk_app::App::new(config)?;
 
-                    app.run().with_context(|| {
-                        format!(
-                            "Cannot start the server at \"{}\". It is probably already running.",
-                            app.addr()
-                        )
-                    })?;
+                    app.run()?;
 
                     // get the app version
                     let version = client.version()?.version;
@@ -157,7 +161,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
         }
         CliCommand::Signer(a) => match a.command {
             SignerCommand::Generate => {
-                let j = client.generate_signer()?;
+                let j = client.signer_generate()?;
                 serde_json::to_value(j)?
             }
             SignerCommand::JadeId { emulator } => {
@@ -165,11 +169,16 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 serde_json::to_value(j)?
             }
             SignerCommand::Sign { signer, pset } => {
-                let r = client.sign(signer, pset)?;
+                let r = client.signer_sign(signer, pset)?;
                 serde_json::to_value(r)?
             }
-            SignerCommand::LoadSoftware { signer, mnemonic } => {
-                let j = client.signer_load_software(signer, mnemonic)?;
+            SignerCommand::LoadSoftware {
+                signer,
+                mnemonic,
+                persist,
+            } => {
+                let persist = persist.expect("required");
+                let j = client.signer_load_software(signer, mnemonic, persist)?;
                 serde_json::to_value(j)?
             }
             SignerCommand::LoadJade {
@@ -187,9 +196,13 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 let j = client.signer_load_external(signer, fingerprint)?;
                 serde_json::to_value(j)?
             }
-            SignerCommand::List => serde_json::to_value(client.list_signers()?)?,
+            SignerCommand::List => serde_json::to_value(client.signer_list()?)?,
+            SignerCommand::Details { signer } => {
+                let r = client.signer_details(signer)?;
+                serde_json::to_value(r)?
+            }
             SignerCommand::Unload { signer } => {
-                let r = client.unload_signer(signer)?;
+                let r = client.signer_unload(signer)?;
                 serde_json::to_value(r)?
             }
             SignerCommand::SinglesigDesc {
@@ -197,7 +210,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 descriptor_blinding_key,
                 kind,
             } => {
-                let r = client.singlesig_descriptor(
+                let r = client.signer_singlesig_descriptor(
                     signer,
                     descriptor_blinding_key.to_string(),
                     kind.to_string(),
@@ -205,28 +218,28 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 serde_json::to_value(r)?
             }
             SignerCommand::Xpub { signer, kind } => {
-                let r = client.xpub(signer, kind.to_string())?;
+                let r = client.signer_xpub(signer, kind.to_string())?;
                 serde_json::to_value(r)?
             }
             SignerCommand::RegisterMultisig { signer, wallet } => {
-                let r = client.register_multisig(signer, wallet)?;
+                let r = client.signer_register_multisig(signer, wallet)?;
                 serde_json::to_value(r)?
             }
         },
         CliCommand::Wallet(a) => match a.command {
             WalletCommand::Load { descriptor, wallet } => {
-                let r = client.load_wallet(descriptor, wallet)?;
+                let r = client.wallet_load(descriptor, wallet)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::Unload { wallet } => {
-                let r = client.unload_wallet(wallet)?;
+                let r = client.wallet_unload(wallet)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::Balance {
                 wallet,
                 with_tickers,
             } => {
-                let r = client.balance(wallet, with_tickers)?;
+                let r = client.wallet_balance(wallet, with_tickers)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::Send {
@@ -242,18 +255,20 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     );
                 }
 
-                let r = client.send_many(wallet, addressees, fee_rate)?;
+                let r = client.wallet_send_many(wallet, addressees, fee_rate)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::Address {
                 index,
                 wallet,
                 signer,
+                with_text_qr,
+                with_uri_qr,
             } => {
-                let r = client.address(wallet, index, signer)?;
+                let r = client.wallet_address(wallet, index, signer, with_text_qr, with_uri_qr)?;
                 serde_json::to_value(r)?
             }
-            WalletCommand::List => serde_json::to_value(client.list_wallets()?)?,
+            WalletCommand::List => serde_json::to_value(client.wallet_list()?)?,
             WalletCommand::Issue {
                 wallet,
                 satoshi_asset,
@@ -263,7 +278,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 contract,
                 fee_rate,
             } => {
-                let r = client.issue(
+                let r = client.wallet_issue(
                     wallet,
                     satoshi_asset,
                     address_asset,
@@ -281,7 +296,17 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 address_asset,
                 fee_rate,
             } => {
-                let r = client.reissue(wallet, asset, satoshi_asset, address_asset, fee_rate)?;
+                let r =
+                    client.wallet_reissue(wallet, asset, satoshi_asset, address_asset, fee_rate)?;
+                serde_json::to_value(r)?
+            }
+            WalletCommand::Burn {
+                wallet,
+                asset,
+                satoshi_asset,
+                fee_rate,
+            } => {
+                let r = client.wallet_burn(wallet, asset, satoshi_asset, fee_rate)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::MultisigDesc {
@@ -290,7 +315,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 threshold,
                 keyorigin_xpub,
             } => {
-                let r = client.multisig_descriptor(
+                let r = client.wallet_multisig_descriptor(
                     descriptor_blinding_key.to_string(),
                     kind.to_string(),
                     threshold,
@@ -303,7 +328,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 pset,
                 wallet,
             } => {
-                let r = client.broadcast(wallet, dry_run, pset)?;
+                let r = client.wallet_broadcast(wallet, dry_run, pset)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::Details { wallet } => {
@@ -333,6 +358,14 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 let r = client.wallet_txs(wallet, with_tickers)?;
                 serde_json::to_value(r)?
             }
+            WalletCommand::Tx {
+                wallet,
+                txid,
+                from_explorer,
+            } => {
+                let r = client.wallet_tx(wallet, txid, from_explorer)?;
+                serde_json::to_value(r)?
+            }
             WalletCommand::SetTxMemo { wallet, txid, memo } => {
                 let r = client.wallet_set_tx_memo(wallet, txid, memo)?;
                 serde_json::to_value(r)?
@@ -355,32 +388,35 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 ticker,
                 version,
             } => {
-                let r = client.contract(domain, issuer_pubkey, name, precision, ticker, version)?;
+                let r = client.asset_contract(
+                    domain,
+                    issuer_pubkey,
+                    name,
+                    precision,
+                    ticker,
+                    version,
+                )?;
                 serde_json::to_value(r)?
             }
             AssetCommand::Details { asset } => {
                 let r = client.asset_details(asset)?;
                 serde_json::to_value(r)?
             }
-            AssetCommand::List => serde_json::to_value(client.list_assets()?)?,
+            AssetCommand::List => serde_json::to_value(client.asset_list()?)?,
             AssetCommand::Insert {
                 asset,
+                issuance_tx,
                 contract,
-                prev_txid,
-                prev_vout,
-                is_confidential,
             } => {
-                let r = client.asset_insert(
-                    asset,
-                    contract,
-                    prev_txid,
-                    prev_vout,
-                    Some(is_confidential),
-                )?;
+                let r = client.asset_insert(asset, issuance_tx, contract)?;
                 serde_json::to_value(r)?
             }
             AssetCommand::Remove { asset } => {
                 let r = client.asset_remove(asset)?;
+                serde_json::to_value(r)?
+            }
+            AssetCommand::FromExplorer { asset } => {
+                let r = client.asset_from_explorer(asset)?;
                 serde_json::to_value(r)?
             }
             AssetCommand::Publish { asset } => {

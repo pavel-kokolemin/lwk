@@ -23,19 +23,19 @@ pub struct Version {
 
 /// Response for generate signer
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct GenerateSigner {
+pub struct SignerGenerate {
     /// Randomly generated mnemonic from the server
     pub mnemonic: String,
 }
 
 /// Response for list signers call
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct ListSigners {
+pub struct SignerList {
     /// Returned signers currently loaded in the server
     pub signers: Vec<Signer>,
 }
 
-/// Wallet response, returned from various call such as [`request::LoadWallet`], [`request::UnloadWallet`]
+/// Wallet response, returned from various call such as [`request::WalletLoad`], [`request::WalletUnload`]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Wallet {
     /// Public descriptor definining wallet outputs
@@ -47,21 +47,21 @@ pub struct Wallet {
 
 /// Response for list wallets call
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct ListWallets {
+pub struct WalletList {
     /// Returned wallets currently loaded in the server
     pub wallets: Vec<Wallet>,
 }
 
 /// Response for unload wallet call
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct UnloadWallet {
+pub struct WalletUnload {
     /// Details of the wallet unloaded from the server
     pub unloaded: Wallet,
 }
 
 /// Response for unload signer call
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct UnloadSigner {
+pub struct SignerUnload {
     /// Details of the signer unloaded from the server
     pub unloaded: Signer,
 }
@@ -74,20 +74,11 @@ pub struct Signer {
 
     /// The fingerprint of the signer, 4 bytes returned as 8 hex characters
     pub fingerprint: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-
-    /// Full identifier of the signer, of which the fingerprint is a subset
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-
-    /// Master xpub of the signer
-    pub xpub: Option<String>,
-    // TODO add kind of signer?
 }
 
 /// Address response
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Address {
+pub struct WalletAddress {
     /// The receiving address
     pub address: String,
 
@@ -96,11 +87,19 @@ pub struct Address {
 
     /// Memo
     pub memo: String,
+
+    /// QR code encoded as text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_qr: Option<String>,
+
+    /// QR code image encoded as uri
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri_qr: Option<String>,
 }
 
 /// Balance respone
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Balance {
+pub struct WalletBalance {
     /// A map of the balance of every asset in the wallet
     pub balance: HashMap<String, i64>,
 }
@@ -114,35 +113,35 @@ pub struct Pset {
 
 /// Response containing a single signature descriptor
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SinglesigDescriptor {
+pub struct SignerSinglesigDescriptor {
     /// The singlesig descriptor
     pub descriptor: String,
 }
 
 /// Response containing a multi signature descriptor
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct MultisigDescriptor {
+pub struct WalletMultisigDescriptor {
     /// The multisig descriptor
     pub descriptor: String,
 }
 
 /// A response containing an xpub with keyorigin
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Xpub {
+pub struct SignerXpub {
     /// The xpub with keyorigin prepended (fingerprint+derivation path)
     pub keyorigin_xpub: String,
 }
 
 /// The response of a broadcast
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Broadcast {
+pub struct WalletBroadcast {
     /// The txid of the transaction just broadacasted
     pub txid: String,
 }
 
 /// A response of a JSON contract containing asset metadata and validated according to the contract rules
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct Contract {
+pub struct AssetContract {
     /// Entity emitting the asset
     pub entity: Entity,
 
@@ -169,15 +168,44 @@ pub struct Entity {
     domain: String,
 }
 
-/// Details of a signer
+/// Details of a signer (short version)
+///
+/// Intended for use in complex responses,
+/// eg when showing PSET details
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SignerDetails {
+pub struct SignerShortDetails {
     /// The name of the signer
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
     /// The fingerprint of the signer
     pub fingerprint: String,
+}
+
+/// Details of a loaded signer
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SignerDetails {
+    /// Signer name
+    pub name: String,
+
+    /// Fingerprint
+    pub fingerprint: String,
+
+    /// Full identifier of the signer, of which the fingerprint is a subset
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// Master xpub
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xpub: Option<String>,
+
+    /// Mnemonic
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnemonic: Option<String>,
+
+    /// Signer type
+    #[serde(rename = "type")]
+    pub type_: String,
 }
 
 /// Details of a wallet
@@ -191,7 +219,7 @@ pub struct WalletDetails {
     pub type_: String,
 
     /// Signers of this wallet
-    pub signers: Vec<SignerDetails>,
+    pub signers: Vec<SignerShortDetails>,
 
     /// Warnings on this wallet
     pub warnings: String,
@@ -255,10 +283,10 @@ pub struct Reissuance {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WalletPsetDetails {
     /// Signatures contained in the PSET
-    pub has_signatures_from: Vec<SignerDetails>,
+    pub has_signatures_from: Vec<SignerShortDetails>,
 
     /// Signature required to spend but missing in the PSET
-    pub missing_signatures_from: Vec<SignerDetails>,
+    pub missing_signatures_from: Vec<SignerShortDetails>,
 
     /// Net balance of the assets for the point of view of the given wallet
     pub balance: HashMap<String, i64>,
@@ -341,6 +369,13 @@ pub struct WalletTxs {
     pub txs: Vec<Tx>,
 }
 
+/// Transaction
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WalletTx {
+    /// Transaction in hex
+    pub tx: String,
+}
+
 /// Details of an asset
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AssetDetails {
@@ -373,7 +408,7 @@ pub struct AssetPublish {
 
 /// A list of assets
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct ListAssets {
+pub struct AssetList {
     /// The list of assets
     pub assets: Vec<Asset>,
 }

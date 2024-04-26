@@ -391,8 +391,8 @@ impl From<EsploraTx> for History {
     fn from(value: EsploraTx) -> Self {
         History {
             txid: value.txid,
-            height: value.status.block_height,
-            block_hash: Some(value.status.block_hash),
+            height: value.status.block_height.unwrap_or(-1),
+            block_hash: value.status.block_hash,
         }
     }
 }
@@ -407,8 +407,8 @@ struct EsploraTx {
 
 #[derive(Deserialize)]
 struct Status {
-    block_height: i32,
-    block_hash: BlockHash,
+    block_height: Option<i32>,
+    block_hash: Option<BlockHash>,
 }
 
 #[cfg(test)]
@@ -424,6 +424,7 @@ mod tests {
         elements::Block::consensus_decode(&response.bytes().await.unwrap()[..]).unwrap()
     }
 
+    #[ignore = "Should be integration test, but it is testing private function"]
     #[tokio::test]
     async fn esplora_wasm_local() {
         let server = lwk_test_util::setup(true);
@@ -434,6 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn sleep_test() {
+        // TODO this doesn't last a second when run, is it right?
         super::async_sleep(1).await;
     }
 

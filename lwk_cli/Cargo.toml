@@ -31,6 +31,8 @@ lwk_test_util = { version = "0.2.0" }
 
 [features]
 bindings = ["uniffi"]
+serial = ["lwk_app/serial"]
+registry = []
 
 [[test]]
 name = "e2e"

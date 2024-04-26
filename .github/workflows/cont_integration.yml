@@ -10,11 +10,10 @@ env:
   RUSTFLAGS: "--cfg=web_sys_unstable_apis"
 
 jobs:
-
   build:
     strategy:
       matrix:
-        os: ["macos-12", "ubuntu-22.04"]
+        os: ["macos-12", "ubuntu-22.04", "windows-2022"]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -23,4 +22,16 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev
         if: ${{ matrix.os == 'ubuntu-22.04' }}
       - run: cargo build
+      - run: cargo build --features serial
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: cachix/install-nix-action@v25
+        with:
+          extra_nix_config: |
+            trusted-public-keys = nix.casatta.it:HseKZh7436/vKXfZDBHbhr7wwAkzjLwY5BIq+OOrITg= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            substituters = https://nix.casatta.it https://cache.nixos.org/
+      - run: nix build .
 

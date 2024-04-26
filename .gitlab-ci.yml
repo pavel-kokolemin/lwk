@@ -25,6 +25,11 @@ fmt_clippy:
     - cargo fmt --check
     - cargo clippy --all-targets -- -D warnings
 
+test_clean:
+  image: rust:1.75
+  script:
+    - cargo build
+
 test_wollet:
   extends: .base
   script:
@@ -48,6 +53,7 @@ test_ledger:
 
 test_serial:
   extends: .base
+  variables:
   script:
     - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - cargo test --no-run --features serial
@@ -63,6 +69,11 @@ test_cli:
   script:
     - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - cargo test -p lwk_cli
+
+unit_tests:
+  extends: .base
+  script:
+    - cargo nextest run --lib --profile unit # ensure unit tests don't take more than a sec each
 
 test_coverage:
   extends: .base
@@ -130,10 +141,32 @@ bindings:
 
 wasm:
   extends: .base
+  variables:
+    RUSTFLAGS: "--cfg=web_sys_unstable_apis"
   script:
     - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - cargo check --target wasm32-unknown-unknown -p lwk_common -p lwk_rpc_model -p lwk_containers -p lwk_hwi
-    - cargo check --target wasm32-unknown-unknown -p lwk_wollet --no-default-features --features esplora_wasm
+    - cargo check --target wasm32-unknown-unknown -p lwk_wollet --no-default-features --features esplora_wasm,serial
     - cargo check --target wasm32-unknown-unknown -p lwk_signer --no-default-features
-    - cargo check --target wasm32-unknown-unknown -p lwk_jade --no-default-features --features asyncr
-    - cd lwk_wasm && WASM_BINDGEN_TEST_TIMEOUT=60 wasm-pack test --chrome --headless
+    - cargo check --target wasm32-unknown-unknown -p lwk_jade --no-default-features --features asyncr --features serial
+    - cd lwk_wasm && WASM_BINDGEN_TEST_TIMEOUT=60 wasm-pack test --chrome --headless --features serial
+
+linux-wheels:
+  image:
+    name: ghcr.io/pyo3/maturin
+    entrypoint: [""]
+  script:
+    - pip install uniffi-bindgen==0.26.1 # must be the same as in lwk_bindings/Cargo.toml
+    - maturin build --release -m lwk_bindings/Cargo.toml -b uniffi
+  artifacts:
+    paths:
+      - target/wheels/
+
+nix:
+  image: nixos/nix:2.22.0pre20240417_c16fc2c
+  variables:
+      EXP_FEAT: --extra-experimental-features nix-command --extra-experimental-features flakes
+      CACHE: --extra-trusted-public-keys nix.casatta.it:HseKZh7436/vKXfZDBHbhr7wwAkzjLwY5BIq+OOrITg= --extra-substituters https://nix.casatta.it
+  script:
+    - nix $EXP_FEAT $CACHE build .
+    - nix $EXP_FEAT $CACHE develop . -c cargo test -p lwk_cli --features registry -- registry_publish

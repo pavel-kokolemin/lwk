@@ -38,16 +38,16 @@ impl From<ServerSubCommandsEnum> for Method {
 impl From<WalletSubCommandsEnum> for Method {
     fn from(value: WalletSubCommandsEnum) -> Self {
         match value {
-            WalletSubCommandsEnum::Load => Method::LoadWallet,
-            WalletSubCommandsEnum::Unload => Method::UnloadWallet,
-            WalletSubCommandsEnum::List => Method::ListWallets,
-            WalletSubCommandsEnum::Address => Method::Address,
-            WalletSubCommandsEnum::Balance => Method::Balance,
-            WalletSubCommandsEnum::Send => Method::SendMany,
-            WalletSubCommandsEnum::Issue => Method::Issue,
-            WalletSubCommandsEnum::Reissue => Method::Reissue,
-            WalletSubCommandsEnum::MultisigDesc => Method::MultisigDescriptor,
-            WalletSubCommandsEnum::Broadcast => Method::Broadcast,
+            WalletSubCommandsEnum::Load => Method::WalletLoad,
+            WalletSubCommandsEnum::Unload => Method::WalletUnload,
+            WalletSubCommandsEnum::List => Method::WalletList,
+            WalletSubCommandsEnum::Address => Method::WalletAddress,
+            WalletSubCommandsEnum::Balance => Method::WalletBalance,
+            WalletSubCommandsEnum::Send => Method::WalletSendMany,
+            WalletSubCommandsEnum::Issue => Method::WalletIssue,
+            WalletSubCommandsEnum::Reissue => Method::WalletReissue,
+            WalletSubCommandsEnum::MultisigDesc => Method::WalletMultisigDescriptor,
+            WalletSubCommandsEnum::Broadcast => Method::WalletBroadcast,
             WalletSubCommandsEnum::Details => Method::WalletDetails,
             WalletSubCommandsEnum::Combine => Method::WalletCombine,
             WalletSubCommandsEnum::PsetDetails => Method::WalletPsetDetails,
@@ -62,16 +62,17 @@ impl From<WalletSubCommandsEnum> for Method {
 impl From<SignerSubCommandsEnum> for Method {
     fn from(value: SignerSubCommandsEnum) -> Self {
         match value {
-            SignerSubCommandsEnum::Generate => Method::GenerateSigner,
+            SignerSubCommandsEnum::Generate => Method::SignerGenerate,
             SignerSubCommandsEnum::JadeId => Method::SignerJadeId,
             SignerSubCommandsEnum::LoadSoftware => Method::SignerLoadSoftware,
             SignerSubCommandsEnum::LoadJade => Method::SignerLoadJade,
             SignerSubCommandsEnum::LoadExternal => Method::SignerLoadExternal,
-            SignerSubCommandsEnum::Unload => Method::UnloadSigner,
-            SignerSubCommandsEnum::List => Method::ListSigners,
-            SignerSubCommandsEnum::Sign => Method::Sign,
-            SignerSubCommandsEnum::SinglesigDesc => Method::SinglesigDescriptor,
-            SignerSubCommandsEnum::Xpub => Method::Xpub,
+            SignerSubCommandsEnum::Unload => Method::SignerUnload,
+            SignerSubCommandsEnum::Details => Method::SignerDetails,
+            SignerSubCommandsEnum::List => Method::SignerList,
+            SignerSubCommandsEnum::Sign => Method::SignerSign,
+            SignerSubCommandsEnum::SinglesigDesc => Method::SignerSinglesigDescriptor,
+            SignerSubCommandsEnum::Xpub => Method::SignerXpub,
         }
     }
 }
@@ -79,9 +80,9 @@ impl From<SignerSubCommandsEnum> for Method {
 impl From<AssetSubCommandsEnum> for Method {
     fn from(value: AssetSubCommandsEnum) -> Self {
         match value {
-            AssetSubCommandsEnum::Contract => Method::Contract,
+            AssetSubCommandsEnum::Contract => Method::AssetContract,
             AssetSubCommandsEnum::Details => Method::AssetDetails,
-            AssetSubCommandsEnum::List => Method::ListAssets,
+            AssetSubCommandsEnum::List => Method::AssetList,
             AssetSubCommandsEnum::Insert => Method::AssetInsert,
             AssetSubCommandsEnum::Remove => Method::AssetRemove,
             AssetSubCommandsEnum::Publish => Method::AssetPublish,
