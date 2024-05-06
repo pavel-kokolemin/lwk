@@ -16,11 +16,13 @@ pub struct SpeculosArgs;
 impl ImageArgs for SpeculosArgs {
     fn into_iterator(self) -> Box<dyn Iterator<Item = String>> {
         let args = vec![
-            "apps/btc.elf".to_string(),
+            "apps/app.elf".to_string(),
             "-m".to_string(),
             "nanos".to_string(),
             "--display".to_string(),
             "headless".to_string(),
+            "--automation".to_string(),
+            "file:apps/speculos-automation.json".to_string(),
         ];
         Box::new(args.into_iter())
     }

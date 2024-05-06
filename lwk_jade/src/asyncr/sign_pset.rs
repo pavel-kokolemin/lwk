@@ -1,25 +1,28 @@
-use elements::pset::PartiallySignedTransaction;
 use std::collections::HashMap;
+
+use elements::pset::PartiallySignedTransaction;
 
 use crate::{
     create_jade_sign_req, derivation_path_to_vec, protocol::GetSignatureParams, script_code_wpkh,
-    sign_liquid_tx::TxInputParams, Error, Jade,
+    sign_liquid_tx::TxInputParams, Error,
 };
 
-impl Jade {
+use super::{Jade, Stream};
+
+impl<S: Stream> Jade<S> {
     /// Sign a pset from a Jade
-    pub fn sign(&self, pset: &mut PartiallySignedTransaction) -> Result<u32, Error> {
-        let my_fingerprint = self.fingerprint()?;
+    pub async fn sign(&self, pset: &mut PartiallySignedTransaction) -> Result<u32, Error> {
+        let my_fingerprint = self.fingerprint().await?;
 
         // Singlesig signing don't need this, however, it is simpler to always ask for it and once cached is a
         // fast operation anyway (and in a real scenario you may ask for registered multisigs at the beginning of the session)
-        let multisigs_details = self.get_cached_registered_multisigs()?;
+        let multisigs_details = self.get_cached_registered_multisigs().await?;
         let network = self.network;
 
         let params = create_jade_sign_req(pset, my_fingerprint, multisigs_details, network)?;
 
         let mut sigs_added_or_overwritten = 0;
-        let sign_response = self.sign_liquid_tx(params)?;
+        let sign_response = self.sign_liquid_tx(params).await?;
         assert!(sign_response);
 
         let mut signers_commitment = HashMap::new();
@@ -78,7 +81,7 @@ impl Jade {
                         sighash: Some(1),
                         ae_host_commitment: vec![1u8; 32], // TODO verify anti-exfil
                     };
-                    let signer_commitment: Vec<u8> = self.tx_input(params)?.to_vec();
+                    let signer_commitment: Vec<u8> = self.tx_input(params).await?.to_vec();
                     signers_commitment.insert(*want_public_key, signer_commitment);
                 }
             }
@@ -90,7 +93,7 @@ impl Jade {
                     let params = GetSignatureParams {
                         ae_host_entropy: vec![1u8; 32], // TODO verify anti-exfil
                     };
-                    let sig: Vec<u8> = self.get_signature_for_tx(params)?.to_vec();
+                    let sig: Vec<u8> = self.get_signature_for_tx(params).await?.to_vec();
 
                     input.partial_sigs.insert(*public_key, sig);
                     sigs_added_or_overwritten += 1;

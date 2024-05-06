@@ -11,12 +11,14 @@ mod jade;
 mod mnemonic;
 mod network;
 mod pset;
+mod pset_details;
 #[cfg(all(feature = "serial", target_arch = "wasm32"))]
 mod serial;
 mod signer;
 mod tx_builder;
 mod update;
 mod wollet;
+mod xpub;
 
 pub use blockdata::address::{Address, AddressResult};
 pub use blockdata::asset_id::AssetId;
@@ -31,14 +33,16 @@ pub use descriptor::WolletDescriptor;
 pub(crate) use error::Error;
 pub use esplora::EsploraClient;
 #[cfg(all(feature = "serial", target_arch = "wasm32"))]
-pub use jade::Jade;
+pub use jade::{Jade, Singlesig};
 pub use mnemonic::Mnemonic;
 pub use network::Network;
 pub use pset::Pset;
+pub use pset_details::PsetDetails;
 pub use signer::Signer;
 pub use tx_builder::TxBuilder;
 pub use update::Update;
 pub use wollet::Wollet;
+pub use xpub::Xpub;
 
 #[cfg(test)]
 mod tests {

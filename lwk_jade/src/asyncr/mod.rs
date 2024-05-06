@@ -13,9 +13,12 @@ use crate::register_multisig::{
 use crate::sign_liquid_tx::{SignLiquidTxParams, TxInputParams};
 use crate::{json_to_cbor, try_parse_response, vec_to_derivation_path, Error, Network, Result};
 use elements::bitcoin::bip32::{DerivationPath, Fingerprint, Xpub};
+use elements_miniscript::slip77;
 use serde::de::DeserializeOwned;
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
+
+mod sign_pset;
 
 #[derive(Debug)]
 pub struct Jade<S: Stream> {
@@ -27,6 +30,9 @@ pub struct Jade<S: Stream> {
 
     /// Cached master xpub
     cached_xpubs: Mutex<HashMap<DerivationPath, Xpub>>,
+
+    /// Cached multisigs details
+    multisigs_details: Mutex<Option<Vec<RegisteredMultisigDetails>>>,
 }
 
 pub trait Stream {
@@ -64,6 +70,7 @@ impl<S: Stream> Jade<S> {
             stream,
             network,
             cached_xpubs: Mutex::new(HashMap::new()),
+            multisigs_details: Mutex::new(None),
         }
     }
 
@@ -145,6 +152,7 @@ impl<S: Stream> Jade<S> {
     }
 
     pub async fn register_multisig(&self, params: RegisterMultisigParams) -> Result<bool> {
+        self.invalidate_registered_multisigs().await;
         self.send(Request::RegisterMultisig(params)).await
     }
 
@@ -160,16 +168,44 @@ impl<S: Stream> Jade<S> {
     }
 
     pub async fn get_cached_xpub(&self, params: GetXpubParams) -> Result<Xpub> {
-        if let Some(xpub) = self
-            .cached_xpubs
-            .lock()
-            .await
-            .get(&vec_to_derivation_path(&params.path))
-        {
+        let mut guard = self.cached_xpubs.lock().await;
+        let der_path = vec_to_derivation_path(&params.path);
+        if let Some(xpub) = guard.get(&der_path) {
             Ok(*xpub)
         } else {
-            self.get_xpub(params).await
+            let result = self.get_xpub(params).await?;
+            guard.insert(der_path, result);
+            Ok(result)
         }
+    }
+
+    async fn get_cached_registered_multisigs(&self) -> Result<Vec<RegisteredMultisigDetails>> {
+        let mut guard = self.multisigs_details.lock().await;
+        if let Some(multisigs_details) = guard.as_ref() {
+            Ok(multisigs_details.clone())
+        } else {
+            let result = self.ask_registered_multisigs().await?;
+            *guard = Some(result.clone());
+            Ok(result)
+        }
+    }
+
+    async fn ask_registered_multisigs(&self) -> Result<Vec<RegisteredMultisigDetails>> {
+        let mut multisigs_details = Vec::new();
+        // Get all the registered multisigs including the signer
+        for (name, _) in self.get_registered_multisigs().await? {
+            let details = self
+                .get_registered_multisig(GetRegisteredMultisigParams {
+                    multisig_name: name,
+                })
+                .await?;
+            multisigs_details.push(details);
+        }
+        Ok(multisigs_details)
+    }
+
+    async fn invalidate_registered_multisigs(&self) {
+        *self.multisigs_details.lock().await = None;
     }
 
     pub async fn fingerprint(&self) -> Result<Fingerprint> {
@@ -269,8 +305,21 @@ impl<S: Stream> Jade<S> {
         self.get_receive_address(params).await
     }
 
-    pub async fn network(&self) -> Network {
+    pub fn network(&self) -> Network {
         self.network
+    }
+
+    // Should be implemented via the Signer trait, but here we are async...
+    pub async fn slip77_master_blinding_key(&self) -> Result<slip77::MasterBlindingKey> {
+        let params = GetMasterBlindingKeyParams {
+            only_if_silent: false,
+        };
+        let bytes = self.get_master_blinding_key(params).await?;
+        let array: [u8; 32] = bytes
+            .to_vec()
+            .try_into()
+            .map_err(|_| Error::Slip77MasterBlindingKeyInvalidSize)?;
+        Ok(slip77::MasterBlindingKey::from(array))
     }
 
     pub(crate) async fn send<T>(&self, request: Request) -> Result<T>

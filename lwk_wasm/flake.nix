@@ -2,7 +2,7 @@
   description = "wasm-pack setup";
 
   inputs = {
-    nixpkgs = { url = "github:nixos/nixpkgs/nixos-unstable"; };
+    nixpkgs = { url = "github:nixos/nixpkgs/nixos-23.11"; };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs = {
@@ -26,7 +26,8 @@
             buildInputs = with pkgs; [
               cargo
               wasm-pack
-              clang
+              clang_17
+              nodejs_21
               (rust-bin.stable.latest.default.override {
                 extensions = [ "rust-src" ];
                 targets = [ "wasm32-unknown-unknown" ];
@@ -35,6 +36,7 @@
 
             CC_wasm32_unknown_unknown = "clang-17";
             CFLAGS_wasm32_unknown_unknown = "-I${pkgs.clang_17}/resource-root/include";
+            RUSTFLAGS = "--cfg=web_sys_unstable_apis";
 
           }) { pkgs = pkgs; });
     };

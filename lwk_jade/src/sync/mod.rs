@@ -41,6 +41,9 @@ pub struct Jade {
 
     /// Cached xpubs
     cached_xpubs: Mutex<HashMap<DerivationPath, Xpub>>,
+
+    /// Cached multisigs details
+    multisigs_details: Mutex<Option<Vec<RegisteredMultisigDetails>>>,
 }
 
 impl Jade {
@@ -49,6 +52,7 @@ impl Jade {
             conn: Mutex::new(conn),
             network,
             cached_xpubs: Mutex::new(HashMap::new()),
+            multisigs_details: Mutex::new(None),
         }
     }
 
@@ -121,6 +125,7 @@ impl Jade {
     }
 
     pub fn register_multisig(&self, params: RegisterMultisigParams) -> Result<bool> {
+        self.invalidate_registered_multisigs()?;
         self.send(Request::RegisterMultisig(params))
     }
 
@@ -136,15 +141,43 @@ impl Jade {
     }
 
     pub fn get_cached_xpub(&self, params: GetXpubParams) -> Result<Xpub> {
-        if let Some(xpub) = self
-            .cached_xpubs
-            .lock()?
-            .get(&vec_to_derivation_path(&params.path))
-        {
+        let mut guard = self.cached_xpubs.lock()?;
+        let der_path = vec_to_derivation_path(&params.path);
+        if let Some(xpub) = guard.get(&der_path) {
             Ok(*xpub)
         } else {
-            self.get_xpub(params)
+            let result = self.get_xpub(params)?;
+            guard.insert(der_path, result);
+            Ok(result)
         }
+    }
+
+    fn get_cached_registered_multisigs(&self) -> Result<Vec<RegisteredMultisigDetails>> {
+        let mut guard = self.multisigs_details.lock()?;
+        if let Some(multisigs_details) = guard.as_ref() {
+            Ok(multisigs_details.clone())
+        } else {
+            let result = self.ask_registered_multisigs()?;
+            *guard = Some(result.clone());
+            Ok(result)
+        }
+    }
+
+    fn ask_registered_multisigs(&self) -> Result<Vec<RegisteredMultisigDetails>> {
+        let mut multisigs_details = Vec::new();
+        // Get all the registered multisigs including the signer
+        for (name, _) in self.get_registered_multisigs()? {
+            let details = self.get_registered_multisig(GetRegisteredMultisigParams {
+                multisig_name: name,
+            })?;
+            multisigs_details.push(details);
+        }
+        Ok(multisigs_details)
+    }
+
+    fn invalidate_registered_multisigs(&self) -> Result<()> {
+        *self.multisigs_details.lock()? = None;
+        Ok(())
     }
 
     pub fn fingerprint(&self) -> Result<Fingerprint> {

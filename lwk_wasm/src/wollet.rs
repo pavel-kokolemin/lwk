@@ -1,5 +1,7 @@
-use crate::{AddressResult, Error, Network, Pset, Update, WalletTx, WolletDescriptor};
+use crate::{AddressResult, Error, Network, Pset, PsetDetails, Update, WalletTx, WolletDescriptor};
+use lwk_jade::derivation_path_to_vec;
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
+use lwk_wollet::elements_miniscript::ForEachKey;
 use wasm_bindgen::prelude::*;
 
 /// Wrapper of [`lwk_wollet::Wollet`]
@@ -34,9 +36,28 @@ impl Wollet {
     /// If Some return the address at the given index,
     /// otherwise the last unused address.
     pub fn address(&self, index: Option<u32>) -> Result<AddressResult, Error> {
-        // TODO return AddressResult
         let address_result = self.inner.address(index)?;
         Ok(address_result.into())
+    }
+
+    #[wasm_bindgen(js_name = addressFullPath)]
+    pub fn address_full_path(&self, index: u32) -> Result<Vec<u32>, Error> {
+        // TODO we should add the full path to lwk_wollet::AddressResult
+
+        let definite_desc = self
+            .inner
+            .wollet_descriptor()
+            .definite_descriptor(lwk_wollet::Chain::External, index)?;
+        let mut full_path: Vec<u32> = vec![];
+        definite_desc.for_each_key(|k| {
+            if let Some(path) = k.full_derivation_path() {
+                full_path = derivation_path_to_vec(&path);
+            }
+
+            true
+        });
+
+        Ok(full_path)
     }
 
     #[wasm_bindgen(js_name = applyUpdate)]
@@ -64,6 +85,17 @@ impl Wollet {
         self.inner.finalize(&mut pset)?;
         Ok(pset.into())
     }
+
+    #[wasm_bindgen(js_name = psetDetails)]
+    pub fn pset_details(&self, pset: &Pset) -> Result<PsetDetails, Error> {
+        let pset: PartiallySignedTransaction = pset.clone().into();
+        let details = self.inner.get_details(&pset)?;
+        Ok(details.into())
+    }
+
+    pub fn descriptor(&self) -> Result<WolletDescriptor, Error> {
+        Ok(self.inner.wollet_descriptor().into())
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +119,7 @@ mod tests {
             wollet.address(Some(0)).unwrap().address().to_string(),
             "VJLAQiChRTcVDXEBKrRnSBnGccJLxNg45zW8cuDwkhbxb8NVFkb4U2QMWAzot4idqhLMWjtZ7SXA4nrA"
         );
+        assert_eq!(wollet.descriptor().unwrap().to_string(), "ct(slip77(0371e66dde8ab9f3cb19d2c20c8fa2d7bd1ddc73454e6b7ef15f0c5f624d4a86),elsh(wpkh([75ea4a43/49'/1776'/0']xpub6D3Y5EKNsmegjE7azkF2foAYFivHrV5u7tcnN2TXELxv1djNtabCHtp3jMvxqEhTU737mYSUqHD1sA5MdZXQ8DWJLNft1gwtpzXZDsRnrZd/<0;1>/*)))#efvhq75f");
     }
 
     #[ignore = "requires internet connection and takes a while"]
