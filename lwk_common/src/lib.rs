@@ -42,7 +42,6 @@ use elements_miniscript::elements::{
 };
 use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
 use std::collections::btree_map::BTreeMap;
-use std::collections::HashMap;
 
 pub fn derive_script_pubkey(
     descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
@@ -120,7 +119,7 @@ pub fn pset_balance(
     descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
 ) -> Result<PsetBalance, Error> {
     let secp = Secp256k1::new();
-    let mut balances: HashMap<AssetId, i64> = HashMap::new();
+    let mut balances: BTreeMap<AssetId, i64> = BTreeMap::new();
     let mut fee: Option<u64> = None;
     for (idx, input) in pset.inputs().iter().enumerate() {
         match input.witness_utxo.as_ref() {
@@ -283,4 +282,32 @@ pub fn pset_issuances(pset: &PartiallySignedTransaction) -> Vec<Issuance> {
 /// Create the same burn script that Elements Core wallet creates
 pub fn burn_script() -> Script {
     Builder::new().push_opcode(OP_RETURN).into_script()
+}
+
+#[cfg(test)]
+mod test {
+    use elements::{pset::PartiallySignedTransaction, AssetId};
+    use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
+
+    use crate::pset_balance;
+
+    #[test]
+    fn test_pset_details() {
+        let asset_id_str = "38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5";
+        let asset_id: AssetId = asset_id_str.parse().unwrap();
+        let desc_str = include_str!("../test_data/pset_details/descriptor");
+        let desc: ConfidentialDescriptor<DescriptorPublicKey> = desc_str.parse().unwrap();
+
+        let pset_str = include_str!("../test_data/pset_details/pset.base64");
+        let pset: PartiallySignedTransaction = pset_str.parse().unwrap();
+        let balance = pset_balance(&pset, &desc).unwrap();
+        let v = balance.balances.get(&asset_id).unwrap();
+        assert_eq!(*v, 0); // it's correct the balance of this asset 0 because it's a redeposit
+
+        let pset_str = include_str!("../test_data/pset_details/pset2.base64");
+        let pset: PartiallySignedTransaction = pset_str.parse().unwrap();
+        let balance = pset_balance(&pset, &desc).unwrap();
+        let v = balance.balances.get(&asset_id).unwrap();
+        assert_eq!(*v, -1);
+    }
 }

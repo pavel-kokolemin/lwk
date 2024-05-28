@@ -2,6 +2,8 @@ use crate::{AddressResult, Error, Network, Pset, PsetDetails, Update, WalletTx, 
 use lwk_jade::derivation_path_to_vec;
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::elements_miniscript::ForEachKey;
+use serde::Serialize;
+use serde_wasm_bindgen::Serializer;
 use wasm_bindgen::prelude::*;
 
 /// Wrapper of [`lwk_wollet::Wollet`]
@@ -67,7 +69,8 @@ impl Wollet {
 
     pub fn balance(&self) -> Result<JsValue, Error> {
         let balance = self.inner.balance()?;
-        Ok(serde_wasm_bindgen::to_value(&balance)?)
+        let serializer = Serializer::new().serialize_large_number_types_as_bigints(true);
+        Ok(balance.serialize(&serializer)?)
     }
 
     pub fn transactions(&self) -> Result<Vec<WalletTx>, Error> {
@@ -96,6 +99,56 @@ impl Wollet {
     pub fn descriptor(&self) -> Result<WolletDescriptor, Error> {
         Ok(self.inner.wollet_descriptor().into())
     }
+
+    pub fn status(&self) -> u64 {
+        self.inner.status()
+    }
+
+    pub fn tip(&self) -> Tip {
+        self.inner.tip().into()
+    }
+
+    /// wraps [lwk_wollet::Wollet::never_scanned()]
+    #[wasm_bindgen(js_name = neverScanned)]
+    pub fn never_scanned(&self) -> bool {
+        self.inner.never_scanned()
+    }
+}
+
+/// Wrapper of [`lwk_wollet::Tip`]
+#[wasm_bindgen]
+pub struct Tip {
+    inner: lwk_wollet::Tip,
+}
+
+impl From<lwk_wollet::Tip> for Tip {
+    fn from(inner: lwk_wollet::Tip) -> Self {
+        Self { inner }
+    }
+}
+
+#[wasm_bindgen]
+impl Tip {
+    pub fn height(&self) -> u32 {
+        self.inner.height()
+    }
+    pub fn hash(&self) -> String {
+        self.inner.hash().to_string()
+    }
+    pub fn timestamp(&self) -> Option<u32> {
+        self.inner.timestamp()
+    }
+}
+
+#[cfg(test)]
+#[wasm_bindgen]
+pub fn big_number() -> Result<JsValue, Error> {
+    use serde::Serialize;
+    use serde_wasm_bindgen::Serializer;
+
+    let big = 11988790300000000u64;
+    let serializer = Serializer::new().serialize_large_number_types_as_bigints(true);
+    Ok(big.serialize(&serializer)?)
 }
 
 #[cfg(test)]
@@ -111,6 +164,11 @@ mod tests {
     const DESCRIPTOR: &str = "ct(slip77(0371e66dde8ab9f3cb19d2c20c8fa2d7bd1ddc73454e6b7ef15f0c5f624d4a86),elsh(wpkh([75ea4a43/49'/1776'/0']xpub6D3Y5EKNsmegjE7azkF2foAYFivHrV5u7tcnN2TXELxv1djNtabCHtp3jMvxqEhTU737mYSUqHD1sA5MdZXQ8DWJLNft1gwtpzXZDsRnrZd/<0;1>/*)))#efvhq75f";
 
     #[wasm_bindgen_test]
+    fn test_big_number() {
+        super::big_number().unwrap();
+    }
+
+    #[wasm_bindgen_test]
     fn test_wollet_address() {
         let descriptor = WolletDescriptor::new(DESCRIPTOR).unwrap();
         let network = Network::mainnet();
@@ -120,6 +178,7 @@ mod tests {
             "VJLAQiChRTcVDXEBKrRnSBnGccJLxNg45zW8cuDwkhbxb8NVFkb4U2QMWAzot4idqhLMWjtZ7SXA4nrA"
         );
         assert_eq!(wollet.descriptor().unwrap().to_string(), "ct(slip77(0371e66dde8ab9f3cb19d2c20c8fa2d7bd1ddc73454e6b7ef15f0c5f624d4a86),elsh(wpkh([75ea4a43/49'/1776'/0']xpub6D3Y5EKNsmegjE7azkF2foAYFivHrV5u7tcnN2TXELxv1djNtabCHtp3jMvxqEhTU737mYSUqHD1sA5MdZXQ8DWJLNft1gwtpzXZDsRnrZd/<0;1>/*)))#efvhq75f");
+        assert_eq!(wollet.status(), 1421324647);
     }
 
     #[ignore = "requires internet connection and takes a while"]

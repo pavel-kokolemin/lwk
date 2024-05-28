@@ -1,4 +1,5 @@
 mod test_jade;
+mod test_ledger;
 
 use crate::test_jade::jade_setup;
 use electrum_client::ScriptStatus;
@@ -902,26 +903,77 @@ async fn test_esplora_wasm_client() {
     let address = wollet.address(None).unwrap();
     let txid = server.node_sendtoaddress(address.address(), 10000, None);
 
-    let update = wait_update(&mut client, &wollet).await;
+    let update = wait_update_with_txs(&mut client, &wollet).await;
+    dbg!(&update);
     wollet.apply_update(update).unwrap();
     let tx = wollet.transaction(&txid).unwrap().unwrap();
     assert!(tx.height.is_none());
+    assert!(wollet.tip().timestamp().is_some());
 
     server.generate(1);
-    let update = wait_update(&mut client, &wollet).await;
+    let update = wait_update_with_txs(&mut client, &wollet).await;
     wollet.apply_update(update).unwrap();
     let tx = wollet.transaction(&txid).unwrap().unwrap();
     assert!(tx.height.is_some());
+    assert!(wollet.tip().timestamp().is_some());
 }
 
 #[cfg(feature = "esplora_wasm")]
-async fn wait_update(client: &mut EsploraWasmClient, wollet: &Wollet) -> Update {
+async fn wait_update_with_txs(client: &mut EsploraWasmClient, wollet: &Wollet) -> Update {
     for _ in 0..50 {
         let update = client.full_scan(wollet).await.unwrap();
         if let Some(update) = update {
-            return update;
+            if !update.only_tip() {
+                return update;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     panic!("update didn't arrive");
+}
+
+#[test]
+fn test_tip() {
+    let server = setup(false);
+    let mut w = TestWollet::with_test_desc(&server.electrs.electrum_url);
+    w.wait_height(101); // node mines 101 blocks on start
+    assert_eq!(w.tip().height(), 101);
+    assert!(w.tip().timestamp().is_some());
+    server.generate(1);
+    w.wait_height(102);
+    assert_eq!(w.tip().height(), 102);
+    assert!(w.tip().timestamp().is_some());
+}
+
+#[test]
+fn drain() {
+    // Send all funds from a wallet
+    let server = setup(false);
+    let signer = generate_signer();
+    let view_key = generate_view_key();
+    let desc = format!("ct({},elwpkh({}/*))", view_key, signer.xpub());
+    let signers = [&AnySigner::Software(signer)];
+
+    let mut wallet = TestWollet::new(&server.electrs.electrum_url, &desc);
+
+    // One utxo L-BTC
+    wallet.fund_btc(&server);
+    let node_address = server.node_getnewaddress();
+    wallet.send_all_btc(&signers, None, node_address);
+
+    // Multiple utxos
+    wallet.fund_btc(&server);
+    wallet.fund_btc(&server);
+    let utxos = wallet.wollet.utxos().unwrap();
+    assert_eq!(utxos.len(), 2);
+    let node_address = server.node_getnewaddress();
+    wallet.send_all_btc(&signers, None, node_address);
+
+    // Drain ignores assets, since their change handling and coin selection is cosiderably easier
+    wallet.fund_btc(&server);
+    let (asset, token) = wallet.issueasset(&signers, 10, 1, None, None);
+    let node_address = server.node_getnewaddress();
+    wallet.send_all_btc(&signers, None, node_address);
+    assert!(wallet.balance(&asset) > 0);
+    assert!(wallet.balance(&token) > 0);
 }

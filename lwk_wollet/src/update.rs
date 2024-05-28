@@ -2,17 +2,25 @@ use crate::descriptor::Chain;
 use crate::elements::{OutPoint, Script, Transaction, TxOutSecrets, Txid};
 use crate::error::Error;
 use crate::store::{Height, Timestamp};
-use crate::Wollet;
+use crate::{Wollet, WolletDescriptor};
+use aes_gcm_siv::aead::generic_array::GenericArray;
+use aes_gcm_siv::aead::AeadMutInPlace;
+use base64::prelude::*;
 use elements::bitcoin::bip32::ChildNumber;
 use elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
 use elements::encode::{Decodable, Encodable};
 use elements::BlockHeader;
+use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic;
 
+/// Transactions downloaded and unblinded
 #[derive(Default, Clone, PartialEq, Eq, Debug)]
 pub struct DownloadTxResult {
+    /// Transactions downloaded
     pub txs: Vec<(Txid, Transaction)>,
+
+    /// Unblinded outputs of the downloaded transactions
     pub unblinds: Vec<(OutPoint, TxOutSecrets)>,
 }
 
@@ -39,7 +47,6 @@ impl Update {
         self.new_txs.is_empty()
             && self.txid_height_new.is_empty()
             && self.txid_height_delete.is_empty()
-            && self.timestamps.is_empty()
             && self.scripts.is_empty()
     }
     pub fn serialize(&self) -> Result<Vec<u8>, elements::encode::Error> {
@@ -49,6 +56,51 @@ impl Update {
     }
     pub fn deserialize(bytes: &[u8]) -> Result<Update, elements::encode::Error> {
         Update::consensus_decode(bytes)
+    }
+
+    pub fn serialize_encrypted(&self, desc: &WolletDescriptor) -> Result<Vec<u8>, Error> {
+        let mut plaintext = self.serialize()?;
+
+        let mut nonce_bytes = [0u8; 12];
+        thread_rng().fill(&mut nonce_bytes);
+        let nonce = GenericArray::from_slice(&nonce_bytes);
+
+        desc.cipher().encrypt_in_place(nonce, b"", &mut plaintext)?;
+        let ciphertext = plaintext;
+
+        let mut result = Vec::with_capacity(ciphertext.len() + 12);
+        result.extend(nonce.as_slice());
+        result.extend(&ciphertext);
+
+        Ok(result)
+    }
+
+    pub fn serialize_encrypted_base64(&self, desc: &WolletDescriptor) -> Result<String, Error> {
+        let vec = self.serialize_encrypted(desc)?;
+        Ok(BASE64_STANDARD.encode(vec))
+    }
+
+    pub fn deserialize_decrypted(bytes: &[u8], desc: &WolletDescriptor) -> Result<Update, Error> {
+        let nonce_bytes = &bytes[..12];
+        let mut ciphertext = bytes[12..].to_vec();
+
+        let nonce = GenericArray::from_slice(nonce_bytes);
+
+        desc.cipher()
+            .decrypt_in_place(nonce, b"", &mut ciphertext)?;
+        let plaintext = ciphertext;
+
+        Ok(Update::deserialize(&plaintext)?)
+    }
+
+    pub fn deserialize_decrypted_base64(
+        base64: &str,
+        desc: &WolletDescriptor,
+    ) -> Result<Update, Error> {
+        let vec = BASE64_STANDARD
+            .decode(base64)
+            .map_err(|e| Error::Generic(e.to_string()))?;
+        Self::deserialize_decrypted(&vec, desc)
     }
 }
 
@@ -83,9 +135,18 @@ impl Wollet {
         }
 
         store.cache.tip = (tip.height, tip.block_hash());
-        store.cache.all_txs.extend(new_txs.txs);
         store.cache.unblinded.extend(new_txs.unblinds);
-        let txids_unblinded: HashSet<Txid> = store.cache.unblinded.keys().map(|o| o.txid).collect();
+        let mut txids_unblinded: HashSet<Txid> =
+            store.cache.unblinded.keys().map(|o| o.txid).collect();
+        // Handle outgoing txs with no change output
+        for (txid, tx) in &new_txs.txs {
+            for i in &tx.input {
+                if store.cache.unblinded.contains_key(&i.previous_output) {
+                    txids_unblinded.insert(*txid);
+                }
+            }
+        }
+        store.cache.all_txs.extend(new_txs.txs);
         let txid_height: Vec<_> = txid_height_new
             .iter()
             .filter(|(txid, _)| txids_unblinded.contains(txid))
@@ -385,7 +446,7 @@ mod test {
         Script,
     };
 
-    use crate::{update::DownloadTxResult, Chain, Update};
+    use crate::{update::DownloadTxResult, Chain, Update, WolletDescriptor};
 
     use super::EncodableTxOutSecrets;
 
@@ -414,7 +475,9 @@ mod test {
             tip,
         };
         assert!(update.only_tip());
-        update.timestamps.push((0, 0));
+        update
+            .txid_height_delete
+            .push(<elements::Txid as elements::hashes::Hash>::all_zeros());
         assert!(!update.only_tip());
     }
 
@@ -471,6 +534,32 @@ mod test {
         assert_eq!(vec.len(), len);
 
         let back = Update::consensus_decode(&vec[..]).unwrap();
+        assert_eq!(update, back)
+    }
+
+    #[test]
+    fn test_update_decription() {
+        let update = Update::deserialize(&lwk_test_util::update_test_vector_bytes()).unwrap();
+        let desc: WolletDescriptor = lwk_test_util::wollet_descriptor_string().parse().unwrap();
+        let enc_bytes = lwk_test_util::update_test_vector_encrypted_bytes();
+        let update_from_enc = Update::deserialize_decrypted(&enc_bytes, &desc).unwrap();
+        assert_eq!(update, update_from_enc);
+
+        let enc_bytes2 = lwk_test_util::update_test_vector_encrypted_bytes2();
+        let desc2: WolletDescriptor = lwk_test_util::wollet_descriptor_string2().parse().unwrap();
+        Update::deserialize_decrypted(&enc_bytes2, &desc2).unwrap();
+    }
+
+    #[test]
+    fn test_update_base64() {
+        let base64 = lwk_test_util::update_test_vector_encrypted_base64();
+        let desc: WolletDescriptor = lwk_test_util::wollet_descriptor_string().parse().unwrap();
+
+        let update = Update::deserialize_decrypted_base64(&base64, &desc).unwrap();
+        let update_ser = update.serialize_encrypted_base64(&desc).unwrap();
+        assert_ne!(base64, update_ser); // decrypted content is the same, but enryption is not deterministic
+
+        let back = Update::deserialize_decrypted_base64(&update_ser, &desc).unwrap();
         assert_eq!(update, back)
     }
 }

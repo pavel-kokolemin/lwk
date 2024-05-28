@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::hashes::Hash;
 use crate::model::{AddressResult, IssuanceDetails, WalletTx, WalletTxOut};
 use crate::persister::PersistError;
-use crate::store::Store;
+use crate::store::{Height, Store, Timestamp};
 use crate::tx_builder::{extract_issuances, WolletTxBuilder};
 use crate::util::EC;
 use crate::{FsPersister, NoPersist, Persister, Update, WolletDescriptor};
@@ -18,9 +18,11 @@ use elements_miniscript::{psbt, ForEachKey};
 use elements_miniscript::{
     ConfidentialDescriptor, DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
 };
+use fxhash::FxHasher;
 use lwk_common::{burn_script, pset_balance, pset_issuances, pset_signatures, PsetDetails};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hasher;
 use std::path::Path;
 use std::sync::{atomic, Arc};
 
@@ -35,6 +37,14 @@ pub struct Wollet {
 impl std::fmt::Debug for Wollet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "wollet({:?})", self.descriptor)
+    }
+}
+
+impl std::hash::Hash for Wollet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.config.hash(state);
+        self.store.hash(state);
+        self.descriptor.hash(state);
     }
 }
 
@@ -112,8 +122,14 @@ impl Wollet {
     }
 
     /// Get the blockchain tip
-    pub fn tip(&self) -> Result<(u32, BlockHash), Error> {
-        Ok(self.store.cache.tip)
+    pub fn tip(&self) -> Tip {
+        let (height, hash) = self.store.cache.tip;
+        let timestamp = self.store.cache.timestamps.get(&height).cloned();
+        Tip {
+            height,
+            hash,
+            timestamp,
+        }
     }
 
     /// Get a wallet address
@@ -173,47 +189,45 @@ impl Wollet {
                 .all_txs
                 .get(tx_id)
                 .ok_or_else(|| Error::Generic(format!("txos no tx {}", tx_id)))?;
-            let tx_txos: Vec<WalletTxOut> = {
-                tx.output
-                    .clone()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(vout, output)| {
-                        (
-                            OutPoint {
-                                txid: tx.txid(),
-                                vout: vout as u32,
-                            },
-                            output,
-                        )
-                    })
-                    .filter(|(outpoint, _)| !spent.contains(outpoint))
-                    .filter_map(|(outpoint, output)| {
-                        if let Some(unblinded) = self.store.cache.unblinded.get(&outpoint) {
-                            let index = self.index(&output.script_pubkey).ok()?;
-                            return Some(WalletTxOut {
-                                outpoint,
-                                script_pubkey: output.script_pubkey,
-                                height: *height,
-                                unblinded: *unblinded,
-                                wildcard_index: index.1,
-                                ext_int: index.0,
-                            });
-                        }
-                        None
-                    })
-                    .collect()
-            };
+            let tx_txos = tx
+                .output
+                .iter()
+                .enumerate()
+                .map(|(vout, output)| {
+                    (
+                        OutPoint {
+                            txid: *tx_id,
+                            vout: vout as u32,
+                        },
+                        output,
+                    )
+                })
+                .filter(|(outpoint, _)| !spent.contains(outpoint))
+                .filter_map(|(outpoint, output)| {
+                    if let Some(unblinded) = self.store.cache.unblinded.get(&outpoint) {
+                        let index = self.index(&output.script_pubkey).ok()?;
+                        return Some(WalletTxOut {
+                            outpoint,
+                            script_pubkey: output.script_pubkey.clone(),
+                            height: *height,
+                            unblinded: *unblinded,
+                            wildcard_index: index.1,
+                            ext_int: index.0,
+                        });
+                    }
+                    None
+                });
             txos.extend(tx_txos);
         }
-        txos.sort_by(|a, b| b.unblinded.value.cmp(&a.unblinded.value));
 
         Ok(txos)
     }
 
     /// Get the wallet UTXOs
     pub fn utxos(&self) -> Result<Vec<WalletTxOut>, Error> {
-        self.txos_inner(true)
+        let mut utxos = self.txos_inner(true)?;
+        utxos.sort_by(|a, b| b.unblinded.value.cmp(&a.unblinded.value));
+        Ok(utxos)
     }
 
     fn txos(&self) -> Result<HashMap<OutPoint, WalletTxOut>, Error> {
@@ -227,8 +241,8 @@ impl Wollet {
     pub(crate) fn balance_from_utxos(
         &self,
         utxos: &[WalletTxOut],
-    ) -> Result<HashMap<AssetId, u64>, Error> {
-        let mut r = HashMap::new();
+    ) -> Result<BTreeMap<AssetId, u64>, Error> {
+        let mut r = BTreeMap::new();
         r.entry(self.policy_asset()).or_insert(0);
         for u in utxos.iter() {
             *r.entry(u.unblinded.asset).or_default() += u.unblinded.value;
@@ -237,7 +251,7 @@ impl Wollet {
     }
 
     /// Get the wallet balance
-    pub fn balance(&self) -> Result<HashMap<AssetId, u64>, Error> {
+    pub fn balance(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
         let utxos = self.utxos()?;
         self.balance_from_utxos(&utxos)
     }
@@ -265,13 +279,13 @@ impl Wollet {
                 .get(*txid)
                 .ok_or_else(|| Error::Generic(format!("list_tx no tx {}", txid)))?;
 
-            let balance = tx_balance(tx, &txos);
+            let balance = tx_balance(**txid, tx, &txos);
             let fee = tx_fee(tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(tx, &policy_asset, &balance, fee);
             let timestamp = height.and_then(|h| self.store.cache.timestamps.get(&h).cloned());
             let inputs = tx_inputs(tx, &txos);
-            let outputs = tx_outputs(tx, &txos);
+            let outputs = tx_outputs(**txid, tx, &txos);
             txs.push(WalletTx {
                 tx: tx.clone(),
                 txid: **txid,
@@ -295,13 +309,13 @@ impl Wollet {
         if let (Some(height), Some(tx)) = (height, tx) {
             let txos = self.txos()?;
 
-            let balance = tx_balance(tx, &txos);
+            let balance = tx_balance(*txid, tx, &txos);
             let fee = tx_fee(tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(tx, &policy_asset, &balance, fee);
             let timestamp = height.and_then(|h| self.store.cache.timestamps.get(&h).cloned());
             let inputs = tx_inputs(tx, &txos);
-            let outputs = tx_outputs(tx, &txos);
+            let outputs = tx_outputs(*txid, tx, &txos);
 
             Ok(Some(WalletTx {
                 tx: tx.clone(),
@@ -453,11 +467,33 @@ impl Wollet {
         }
         Ok(updates)
     }
+
+    /// A deterministic value derived from the descriptor, the config and the content of this wollet,
+    /// including what's in the wallet store (transactions etc)
+    ///
+    /// In this case, we don't need cryptographic assurance guaranteed by the std default hasher (siphash)
+    /// And we can use a much faster hasher, which is used also in the rust compiler.
+    /// ([source](https://nnethercote.github.io/2021/12/08/a-brutally-effective-hash-function-in-rust.html))
+    pub fn status(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+        std::hash::Hash::hash(&self, &mut hasher);
+        hasher.finish()
+    }
+
+    /// Returns true if this wollet has never received an updated applyed to it
+    pub fn never_scanned(&self) -> bool {
+        self.store.cache.tip == (0, BlockHash::all_zeros())
+    }
 }
 
-fn tx_balance(tx: &Transaction, txos: &HashMap<OutPoint, WalletTxOut>) -> HashMap<AssetId, i64> {
-    let mut balance = HashMap::new();
-    let txid = tx.txid();
+fn tx_balance(
+    txid: Txid,
+    tx: &Transaction,
+    txos: &HashMap<OutPoint, WalletTxOut>,
+) -> BTreeMap<AssetId, i64> {
+    debug_assert_eq!(txid, tx.txid());
+    let mut balance = BTreeMap::new();
+
     for out_idx in 0..tx.output.len() {
         if let Some(txout) = txos.get(&OutPoint::new(txid, out_idx as u32)) {
             *balance.entry(txout.unblinded.asset).or_default() += txout.unblinded.value as i64;
@@ -501,7 +537,7 @@ fn tx_fee(tx: &Transaction) -> u64 {
 fn tx_type(
     tx: &Transaction,
     policy_asset: &AssetId,
-    balance: &HashMap<AssetId, i64>,
+    balance: &BTreeMap<AssetId, i64>,
     fee: u64,
 ) -> String {
     let burn_script = burn_script();
@@ -540,14 +576,41 @@ fn tx_inputs(tx: &Transaction, txos: &HashMap<OutPoint, WalletTxOut>) -> Vec<Opt
         .collect()
 }
 
-fn tx_outputs(tx: &Transaction, txos: &HashMap<OutPoint, WalletTxOut>) -> Vec<Option<WalletTxOut>> {
+fn tx_outputs(
+    txid: Txid, // passed to avoid expensive re-computation
+    tx: &Transaction,
+    txos: &HashMap<OutPoint, WalletTxOut>,
+) -> Vec<Option<WalletTxOut>> {
+    debug_assert_eq!(txid, tx.txid());
+
     (0..(tx.output.len() as u32))
-        .map(|idx| txos.get(&OutPoint::new(tx.txid(), idx)).cloned())
+        .map(|idx| txos.get(&OutPoint::new(txid, idx)).cloned())
         .collect()
+}
+
+/// Blockchain tip
+pub struct Tip {
+    height: Height,
+    hash: BlockHash,
+    timestamp: Option<Timestamp>,
+}
+
+impl Tip {
+    pub fn height(&self) -> Height {
+        self.height
+    }
+    pub fn hash(&self) -> BlockHash {
+        self.hash
+    }
+    pub fn timestamp(&self) -> Option<Timestamp> {
+        self.timestamp
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::str::FromStr;
 
     use super::*;
@@ -674,17 +737,17 @@ mod tests {
     fn fixed_addresses_test() {
         let expected = [
             "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv", //  network: Liquid variant: Wpkh blinding_variant: Slip77
-            "lq1qq06m2c4adfqzjqa4euuk26nd8e0dg3qvt9a9v7pg25vzztxu8xsywfe0247rp5h4yzmdftsahhw64uy8pzfe7mut7x5nry3gj", // network: Liquid variant: Wpkh blinding_variant: Elip151
+            "lq1qqtmf5e3g4ats3yexwdfn6kfhp9sl68kdl47g75k58rvw2w33zuarwfe0247rp5h4yzmdftsahhw64uy8pzfe7k9s63c7cku58", // network: Liquid variant: Wpkh blinding_variant: Elip151
             "VJLCQwwG8s7qUGhpJkQpkf7wLoK785TcK2cPqka8675FeJB7NEHLto5MUJyhJURGJCbFHA6sb6rgTwbh", // network: Liquid variant: ShWpkh blinding_variant: Slip77
-            "VJL5wDQqSCXZKiA2YpdTu8Rs2ZarbBcHsLrUDfAB6znaA6YfRmZi1xFw5zu8Q4CeNgZzpWqMEWvkvPQY", // network: Liquid variant: ShWpkh blinding_variant: Elip151
+            "VJLD3sfRNBrKyQkJp9KpLqSVtD9YWswXctqzdFhsctaDCwLoUcSato1DfspVSGMbk28avytesWFhiv37", // network: Liquid variant: ShWpkh blinding_variant: Elip151
             "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn", // network: LiquidTestnet variant: Wpkh blinding_variant: Slip77
-            "tlq1qqfsazyw6w9gf8ng86gzd90dadrzefcnytjrvhka70vg6mepz8alf85xy50hsn6vhkm5euwt72x878eq6zxx2zqcv5x2cyah2z", // network: LiquidTestnet variant: Wpkh blinding_variant: Elip151 i:5
+            "tlq1qqv74shw44vxlpdhtmwqc2zfr5365hm8p6rg8cjnu77w57000dmuc05xy50hsn6vhkm5euwt72x878eq6zxx2z4zm4jus26k72", // network: LiquidTestnet variant: Wpkh blinding_variant: Elip151 i:5
             "vjTwLVioiKrDJ7zZZn9iQQrxP6RPpcvpHBhzZrbdZKKVZE29FuXSnkXdKcxK3qD5t1rYsdxcm9KYRMji", // network: LiquidTestnet variant: ShWpkh blinding_variant: Slip77
-            "vjTyyMTiuqe2moi5MwampWbyS2AdCargHrwmSBjD5MPuGJPo7CB5S15UWnvhLt6Pdj2kV15Wjm57JN1W", // network: LiquidTestnet variant: ShWpkh blinding_variant: Elip151 i:7
+            "vjU3guCqyPrnKFXsUhpKPhUyduT6Zjr3b2ukPhE9BpiW4LpehTRvw4FHKxkMw7TRAzE7KhtsnkZ4rPth", // network: LiquidTestnet variant: ShWpkh blinding_variant: Elip151 i:7
             "el1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z0z676mna6kdq", // network: ElementsRegtest { policy_asset: 0000000000000000000000000000000000000000000000000000000000000000 } variant: Wpkh blinding_variant: Slip77
-            "el1qqfsazyw6w9gf8ng86gzd90dadrzefcnytjrvhka70vg6mepz8alf85xy50hsn6vhkm5euwt72x878eq6zxx2zmap8zngf0y83", // network: ElementsRegtest { policy_asset: 0000000000000000000000000000000000000000000000000000000000000000 } variant: Wpkh blinding_variant: Elip151 i:9
+            "el1qqv74shw44vxlpdhtmwqc2zfr5365hm8p6rg8cjnu77w57000dmuc05xy50hsn6vhkm5euwt72x878eq6zxx2zw8kxk9q8g9ne", // network: ElementsRegtest { policy_asset: 0000000000000000000000000000000000000000000000000000000000000000 } variant: Wpkh blinding_variant: Elip151 i:9
             "AzpmUtw4GMrEsfz6GKx5SKT1DV3qLS3xtSGdKG351rMjGxoUwS6Vsbu3zu2opBiPtjWs1GnE48uMFFnb", // network: ElementsRegtest { policy_asset: 0000000000000000000000000000000000000000000000000000000000000000 } variant: ShWpkh blinding_variant: Slip77
-            "Azpp7kfyTse4MMhc4VP8rRC2GQo4iPypu7WQBbAeXtS8z3B8nik8WrSuC51C7EbheSh4cdu82kYjWNce", // network: ElementsRegtest { policy_asset: 0000000000000000000000000000000000000000000000000000000000000000 } variant: ShWpkh blinding_variant: Elip151 i:11
+            "AzpsqJR6XRrotoXQBFcgRc52UJ5Y5YyCCHUP96faeMkjn5bzNyzz1uci1EprhTxjBhtRTLiV5k6sWP7j", // network: ElementsRegtest { policy_asset: 0000000000000000000000000000000000000000000000000000000000000000 } variant: ShWpkh blinding_variant: Elip151 i:11
             ];
         let mut i = 0usize;
         let mnemonic = lwk_test_util::TEST_MNEMONIC;
@@ -716,5 +779,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_wollet_status() {
+        let bytes = lwk_test_util::update_test_vector_bytes();
+
+        let update = crate::Update::deserialize(&bytes[..]).unwrap();
+        let exp = "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84'/1'/0']tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*))";
+        let mut wollet = new_wollet(exp);
+
+        let mut hasher = DefaultHasher::new();
+        wollet.hash(&mut hasher);
+        assert_eq!(12092173119280468224, hasher.finish());
+
+        assert!(wollet.never_scanned());
+        wollet.apply_update(update).unwrap();
+        assert!(!wollet.never_scanned());
+
+        let mut hasher = FxHasher::default();
+        wollet.hash(&mut hasher);
+        assert_eq!(16997737043419915973, hasher.finish());
+
+        assert_eq!(16997737043419915973, wollet.status());
     }
 }

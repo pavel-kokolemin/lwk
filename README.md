@@ -76,9 +76,11 @@ Internal crate dependencies are shown in this diagram, where an arrow indicates 
       app-->rpc_model;
 
       jade-->common;
+      ledger-->common;
 
       signer-->common;
       signer-->jade;
+      signer-->ledger;
 
       wollet-->common;
       
@@ -201,7 +203,7 @@ $ cargo install lwk_cli
 or if you want to connect Jade over serial:
 
 ```sh
-$ cargo install lwk_cli --features-serial 
+$ cargo install lwk_cli --features serial 
 ``` 
 
 ### Building LWK_CLI from source

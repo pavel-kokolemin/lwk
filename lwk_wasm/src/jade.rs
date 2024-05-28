@@ -5,12 +5,14 @@ use crate::{
     signer::FakeSigner,
     Error, Network, Pset, WolletDescriptor, Xpub,
 };
-use lwk_common::DescriptorBlindingKey;
+use lwk_common::{Bip, DescriptorBlindingKey, Signer};
 use lwk_jade::{asyncr, protocol::GetXpubParams};
 use lwk_jade::{
     derivation_path_to_vec,
     get_receive_address::{GetReceiveAddressParams, SingleOrMulti, Variant},
+    register_multisig::{JadeDescriptor, RegisterMultisigParams, RegisteredMultisigDetails},
 };
+use lwk_wollet::elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
 use lwk_wollet::{bitcoin::bip32::DerivationPath, elements::pset::PartiallySignedTransaction};
 use wasm_bindgen::prelude::*;
 
@@ -80,12 +82,13 @@ impl Jade {
     #[wasm_bindgen(js_name = getReceiveAddressMulti)]
     pub async fn get_receive_address_multi(
         &self,
-        multisig_name: String,
+        multisig_name: &str,
         path: Vec<u32>,
-        path_n: u32,
     ) -> Result<String, Error> {
         let network = self.inner.network();
         self.inner.unlock().await?;
+        let multi_details = self.get_registered_multisig(multisig_name).await?;
+        let path_n = multi_details.descriptor.signers.len();
         let mut paths = vec![];
         for _ in 0..path_n {
             paths.push(path.clone());
@@ -95,7 +98,7 @@ impl Jade {
             .get_receive_address(GetReceiveAddressParams {
                 network,
                 address: SingleOrMulti::Multi {
-                    multisig_name,
+                    multisig_name: multisig_name.to_string(),
                     paths,
                 },
             })
@@ -119,13 +122,64 @@ impl Jade {
         self.desc(lwk_common::Singlesig::ShWpkh).await
     }
 
-    // Asks all possible derivation needed for standard singlesig wallets (fist account)
+    pub async fn multi(&self, name: &str) -> Result<WolletDescriptor, Error> {
+        let r = self.get_registered_multisig(name).await?;
+        let desc: ConfidentialDescriptor<DescriptorPublicKey> = (&r.descriptor)
+            .try_into()
+            .map_err(|s| Error::Generic(format!("{:?}", s)))?;
+
+        Ok(lwk_wollet::WolletDescriptor::try_from(desc)
+            .map_err(|s| Error::Generic(format!("{:?}", s)))?
+            .into())
+    }
+
+    #[wasm_bindgen(js_name = getRegisteredMultisigs)]
+    pub async fn get_registered_multisigs(&self) -> Result<JsValue, Error> {
+        let wallets = self.inner.get_registered_multisigs().await?;
+        let wallets_str: Vec<_> = wallets.keys().collect();
+        Ok(serde_wasm_bindgen::to_value(&wallets_str)?)
+    }
+
+    #[wasm_bindgen(js_name = keyoriginXpubBip87)]
+    pub async fn keyorigin_xpub_bip87(&self) -> Result<String, Error> {
+        let signer = self.create_fake_signer().await?;
+        let is_mainnet = self.inner.network().is_mainnet();
+
+        Ok(signer
+            .keyorigin_xpub(Bip::Bip87, is_mainnet)
+            .map_err(Error::Generic)?)
+    }
+
+    #[wasm_bindgen(js_name = registerDescriptor)]
+    pub async fn register_descriptor(
+        &self,
+        name: &str,
+        desc: &WolletDescriptor,
+    ) -> Result<bool, Error> {
+        let descriptor: JadeDescriptor = desc.as_ref().as_ref().try_into().unwrap();
+        let network = self.inner.network();
+        let result = self
+            .inner
+            .register_multisig(RegisterMultisigParams {
+                descriptor,
+                multisig_name: name.to_string(),
+                network,
+            })
+            .await?;
+        Ok(result)
+    }
+}
+
+impl Jade {
+    // Asks all possible derivation needed for standard singlesig wallets (first account)
+    // TODO get_cached_xpub is faster after first, but we should cache the fake signer as field in Jade
+    // so that we are not asking the master blinding every time
     async fn create_fake_signer(&self) -> Result<FakeSigner, Error> {
         let network = self.inner.network();
         self.inner.unlock().await?;
         let mut paths = HashMap::new();
 
-        for purpose in [49, 84] {
+        for purpose in [49, 84, 87] {
             for coin_type in [1, 1776] {
                 let derivation_path_str = format!("m/{purpose}h/{coin_type}h/0h");
                 let derivation_path = DerivationPath::from_str(&derivation_path_str)?;
@@ -144,16 +198,27 @@ impl Jade {
 
     async fn desc(&self, script_variant: lwk_common::Singlesig) -> Result<WolletDescriptor, Error> {
         let signer = self.create_fake_signer().await?;
-        let is_mainnet = matches!(self.inner.network(), lwk_jade::Network::Liquid);
 
         let desc_str = lwk_common::singlesig_desc(
             &signer,
             script_variant,
             DescriptorBlindingKey::Slip77,
-            is_mainnet,
+            self.inner.network().is_mainnet(),
         )
-        .map_err(|s| Error::Generic(s))?;
+        .map_err(Error::Generic)?;
         WolletDescriptor::new(&desc_str)
+    }
+
+    async fn get_registered_multisig(
+        &self,
+        name: &str,
+    ) -> Result<RegisteredMultisigDetails, Error> {
+        // TODO should call a cached methods to minimize roundtrip on serial
+        let param = lwk_jade::register_multisig::GetRegisteredMultisigParams {
+            multisig_name: name.to_string(),
+        };
+        let r = self.inner.get_registered_multisig(param).await?;
+        Ok(r)
     }
 }
 

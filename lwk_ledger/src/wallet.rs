@@ -2,7 +2,7 @@ use core::convert::From;
 use core::iter::IntoIterator;
 use core::str::FromStr;
 
-use bitcoin::{
+use elements_miniscript::elements::bitcoin::{
     bip32::{DerivationPath, Error, Fingerprint, KeySource, Xpub},
     consensus::encode::{self, VarInt},
     hashes::{sha256, Hash, HashEngine},
@@ -29,6 +29,7 @@ pub enum AddressType {
 }
 
 /// Represents a wallet stored with a wallet policy.
+#[derive(Clone)]
 pub struct WalletPolicy {
     /// wallet name (ASCII string, max 64 bytes)
     pub name: String,
@@ -67,6 +68,8 @@ impl WalletPolicy {
         threshold: usize,
         keys: impl IntoIterator<Item = T>,
         sorted: bool,
+        // TODO: use better type
+        descriptor_blinding_key: Option<String>,
     ) -> Result<Self, WalletError> {
         let keys: Vec<WalletPubKey> = keys.into_iter().map(|k| k.into()).collect();
         if threshold < 1 || threshold > keys.len() {
@@ -82,7 +85,7 @@ impl WalletPolicy {
             .collect::<Vec<String>>()
             .join(",");
 
-        let descriptor_template = match address_type {
+        let mut descriptor_template = match address_type {
             AddressType::Legacy => format!("sh({}({},{}))", multisig_op, threshold, keys_str),
             AddressType::NativeSegwit => {
                 format!("wsh({}({},{}))", multisig_op, threshold, keys_str)
@@ -92,6 +95,10 @@ impl WalletPolicy {
             }
             _ => return Err(WalletError::UnsupportedAddressType),
         };
+
+        if let Some(descriptor_blinding_key) = descriptor_blinding_key {
+            descriptor_template = format!("ct({descriptor_blinding_key},{descriptor_template})");
+        }
 
         Ok(Self {
             name,
@@ -179,7 +186,7 @@ pub enum WalletError {
     InvalidPolicy,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone)]
 pub struct WalletPubKey {
     pub inner: Xpub,
     pub source: Option<KeySource>,
@@ -282,8 +289,8 @@ impl core::fmt::Display for WalletPubKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::hex::FromHex;
     use core::str::FromStr;
+    use elements_miniscript::elements::bitcoin::hashes::hex::FromHex;
 
     const MASTER_KEY_EXAMPLE: &str = "[5c9e228d]tpubDEGquuorgFNb8bjh5kNZQMPtABJzoWwNm78FUmeoPkfRtoPF7JLrtoZeT3J3ybq1HmC3Rn1Q8wFQ8J5usanzups5rj7PJoQLNyvq8QbJruW/**";
     const KEY_EXAMPLE: &str = "[5c9e228d/48'/1'/0'/0']tpubDEGquuorgFNb8bjh5kNZQMPtABJzoWwNm78FUmeoPkfRtoPF7JLrtoZeT3J3ybq1HmC3Rn1Q8wFQ8J5usanzups5rj7PJoQLNyvq8QbJruW/**";

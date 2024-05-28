@@ -45,6 +45,18 @@ impl TxBuilder {
         self.inner.fee_rate(fee_rate).into()
     }
 
+    /// Select all available L-BTC inputs
+    #[wasm_bindgen(js_name = drainLbtcWallet)]
+    pub fn drain_lbtc_wallet(self) -> TxBuilder {
+        self.inner.drain_lbtc_wallet().into()
+    }
+
+    /// Sets the address to drain excess L-BTC to
+    #[wasm_bindgen(js_name = drainLbtcTo)]
+    pub fn drain_lbtc_to(self, address: Address) -> TxBuilder {
+        self.inner.drain_lbtc_to(address.into()).into()
+    }
+
     /// Add a recipient receiving L-BTC
     ///
     /// Errors if address's network is incompatible
@@ -159,12 +171,12 @@ mod tests {
         let policy = network.policy_asset();
 
         let mut builder = TxBuilder::new(&network);
-        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [], fee_rate: 100.0, issuance_request: None }");
+        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [], fee_rate: 100.0, issuance_request: None, drain_lbtc: false, drain_to: None }");
 
         builder = builder.fee_rate(Some(200.0));
-        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [], fee_rate: 200.0, issuance_request: None }");
+        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [], fee_rate: 200.0, issuance_request: None, drain_lbtc: false, drain_to: None }");
 
         builder = builder.add_burn(1000, &policy);
-        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [Recipient { satoshi: 1000, script_pubkey: Script(OP_RETURN), blinding_pubkey: None, asset: 6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d }], fee_rate: 200.0, issuance_request: None }");
+        assert_eq!(builder.to_string(), "TxBuilder { network: Liquid, recipients: [Recipient { satoshi: 1000, script_pubkey: Script(OP_RETURN), blinding_pubkey: None, asset: 6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d }], fee_rate: 200.0, issuance_request: None, drain_lbtc: false, drain_to: None }");
     }
 }

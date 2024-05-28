@@ -1,4 +1,5 @@
-use bitcoin::bip32::DerivationPath;
+use elements_miniscript::elements::bitcoin::bip32::DerivationPath;
+use elements_miniscript::elements::AddressParams;
 use lwk_containers::testcontainers::clients;
 use lwk_containers::{LedgerEmulator, LEDGER_EMULATOR_PORT};
 use lwk_ledger::*;
@@ -9,7 +10,7 @@ fn test_ledger_commands() {
     let ledger = LedgerEmulator::new().expect("test");
     let container = docker.run(ledger);
     let port = container.get_host_port_ipv4(LEDGER_EMULATOR_PORT);
-    let client = new(port);
+    let client = Ledger::new(port).client;
     let (name, version, _flags) = client.get_version().unwrap();
     assert_eq!(version, "2.0.4");
     assert_eq!(name, "Liquid Regtest");
@@ -51,7 +52,63 @@ fn test_ledger_commands() {
         2,
         keys,
         false,
+        Some(format!("slip77({master_blinding_key})")),
     )
     .unwrap();
-    let (_id, _hmac) = client.register_wallet(&wallet_policy).unwrap();
+    let (id, hmac) = client.register_wallet(&wallet_policy).unwrap();
+
+    assert_eq!(id, wallet_policy.id());
+
+    let params = &AddressParams::ELEMENTS;
+    let address = client
+        .get_wallet_address(
+            &wallet_policy,
+            Some(&hmac),
+            false, // change
+            0,     // address index
+            false, // display
+            params,
+        )
+        .unwrap();
+    assert_eq!(
+        address.to_string(),
+        "AzpwDWqFZA5sMX2TK33kiNrn115ChnERKd2G2J4rffpRPcAnhnZ4EpYyJdjJ234ErsWrEF5bwtoyjpXx"
+    );
+
+    // Single sig, no need to register the wallet
+    let version = Version::V1;
+    let path: DerivationPath = "m/84h/1h/0h".parse().unwrap();
+    let xpub = client.get_extended_pubkey(&path, false).unwrap();
+    let mut wpk0 = WalletPubKey::from(((fingerprint, path), xpub));
+    wpk0.multipath = Some("/**".to_string());
+    let ss_keys = vec![wpk0];
+    let desc = format!("ct(slip77({master_blinding_key}),wpkh(@0))");
+    let ss = WalletPolicy::new("ss".to_string(), version, desc, ss_keys);
+    let address = client
+        .get_wallet_address(
+            &ss, None,  // hmac
+            false, // change
+            0,     // address index
+            false, // display
+            params,
+        )
+        .unwrap();
+    let expected = "el1qqvk6gl0lgs80w8rargdqyfsl7f0llsttzsx8gd4fz262cjnt0uxh6y68aq4qx76ahvuvlrz8t8ey9v04clsf58w045gzmxga3";
+    assert_eq!(address.to_string(), expected);
+
+    let view_key = "1111111111111111111111111111111111111111111111111111111111111111";
+    let desc = format!("ct({view_key},wpkh(@0))");
+    let mut ss_view = ss.clone();
+    ss_view.descriptor_template = desc;
+    let address = client
+        .get_wallet_address(
+            &ss_view, None,  // hmac
+            false, // change
+            0,     // address index
+            false, // display
+            params,
+        )
+        .unwrap();
+    let expected = "el1qq2fk6wmtxd49cymtpprte3ue5x4elp99s5zltzhy8pwjf0pqw7qeyy68aq4qx76ahvuvlrz8t8ey9v04clsf503tn8tvv859j";
+    assert_eq!(address.to_string(), expected);
 }

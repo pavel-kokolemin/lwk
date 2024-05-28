@@ -67,6 +67,8 @@ pub struct TxBuilder {
     fee_rate: f32,
     issuance_request: IssuanceRequest,
     blind: bool,
+    drain_lbtc: bool,
+    drain_to: Option<Address>,
 }
 
 impl TxBuilder {
@@ -78,6 +80,8 @@ impl TxBuilder {
             fee_rate: 100.0,
             issuance_request: IssuanceRequest::None,
             blind: true,
+            drain_lbtc: false,
+            drain_to: None,
         }
     }
 
@@ -85,6 +89,7 @@ impl TxBuilder {
         self.network
     }
 
+    /// Add recipient to the internal list
     pub fn add_recipient(
         self,
         address: &Address,
@@ -99,6 +104,7 @@ impl TxBuilder {
         self.add_unvalidated_recipient(&rec)
     }
 
+    /// Add unvalidated recipient to the internal list
     pub fn add_unvalidated_recipient(
         mut self,
         recipient: &UnvalidatedRecipient,
@@ -108,6 +114,7 @@ impl TxBuilder {
         Ok(self)
     }
 
+    /// Add validated recipient to the internal list
     pub fn add_validated_recipient(mut self, recipient: Recipient) -> Self {
         self.recipients.push(recipient);
         self
@@ -125,16 +132,19 @@ impl TxBuilder {
         Ok(self)
     }
 
+    /// Add L-BTC recipient to the internal list
     pub fn add_lbtc_recipient(self, address: &Address, satoshi: u64) -> Result<Self, Error> {
         let rec = UnvalidatedRecipient::lbtc(address.to_string(), satoshi);
         self.add_unvalidated_recipient(&rec)
     }
 
+    /// Add burn output the internal list
     pub fn add_burn(self, satoshi: u64, asset_id: AssetId) -> Result<Self, Error> {
         let rec = UnvalidatedRecipient::burn(asset_id.to_string(), satoshi);
         self.add_unvalidated_recipient(&rec)
     }
 
+    /// Set custom fee rate
     pub fn fee_rate(mut self, fee_rate: Option<f32>) -> Self {
         if let Some(fee_rate) = fee_rate {
             self.fee_rate = fee_rate
@@ -225,6 +235,19 @@ impl TxBuilder {
         Ok(self)
     }
 
+    /// Select all available L-BTC inputs
+    pub fn drain_lbtc_wallet(mut self) -> Self {
+        self.drain_lbtc = true;
+        self
+    }
+
+    /// Sets the address to drain excess L-BTC to
+    pub fn drain_lbtc_to(mut self, address: Address) -> Self {
+        self.drain_to = Some(address);
+        self
+    }
+
+    /// Finish building the transaction
     pub fn finish(self, wollet: &Wollet) -> Result<PartiallySignedTransaction, Error> {
         // Init PSET
         let mut pset = PartiallySignedTransaction::new_v2();
@@ -391,11 +414,15 @@ impl TxBuilder {
             return Err(Error::InsufficientFunds);
         }
         let satoshi_change = satoshi_in - satoshi_out - temp_fee;
-        let addressee = wollet.addressee_change(
-            satoshi_change,
-            wollet.policy_asset(),
-            &mut last_unused_internal,
-        )?;
+        let addressee = if let Some(address) = self.drain_to {
+            Recipient::from_address(satoshi_change, &address, wollet.policy_asset())
+        } else {
+            wollet.addressee_change(
+                satoshi_change,
+                wollet.policy_asset(),
+                &mut last_unused_internal,
+            )?
+        };
         wollet.add_output(&mut pset, &addressee)?;
         let fee_output =
             Output::new_explicit(Script::default(), temp_fee, wollet.policy_asset(), None);
@@ -569,6 +596,22 @@ impl<'a> WolletTxBuilder<'a> {
         Self {
             wollet: self.wollet,
             inner: self.inner.blind(blind),
+        }
+    }
+
+    /// Wrapper of [`TxBuilder::drain_lbtc_wallet()`]
+    pub fn drain_lbtc_wallet(self) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.drain_lbtc_wallet(),
+        }
+    }
+
+    /// Wrapper of [`TxBuilder::drain_lbtc_to()`]
+    pub fn drain_lbtc_to(self, address: Address) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.drain_lbtc_to(address),
         }
     }
 }

@@ -1,6 +1,10 @@
 use std::{fmt::Display, str::FromStr};
 
+use aes_gcm_siv::aead::generic_array::GenericArray;
+use aes_gcm_siv::aead::NewAead;
+use aes_gcm_siv::Aes256GcmSiv;
 use elements::bitcoin::{bip32::ChildNumber, WitnessVersion};
+use elements::hashes::{sha256t_hash_newtype, Hash};
 use elements::{Address, AddressParams};
 use elements_miniscript::{
     confidential::Key,
@@ -9,6 +13,15 @@ use elements_miniscript::{
 };
 use serde::{Deserialize, Serialize};
 
+sha256t_hash_newtype! {
+    /// The tag of the hash
+    pub struct EncryptionKeyTag = hash_str("LWK-FS-Encryption-Key/1.0");
+
+    /// A tagged hash to generate the key for encryption in the encrypted file system persister
+    #[hash_newtype(forward)]
+    pub struct EncryptionKeyHash(_);
+}
+
 #[derive(Debug, Clone)]
 /// A wrapper that contains only the subset of CT descriptors handled by wollet
 pub struct WolletDescriptor(ConfidentialDescriptor<DescriptorPublicKey>);
@@ -16,6 +29,12 @@ pub struct WolletDescriptor(ConfidentialDescriptor<DescriptorPublicKey>);
 impl Display for WolletDescriptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.0, f)
+    }
+}
+
+impl std::hash::Hash for WolletDescriptor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_string().hash(state);
     }
 }
 
@@ -74,7 +93,7 @@ impl FromStr for WolletDescriptor {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub enum Chain {
     /// External address, shown when asked for a payment.
     /// Wallet having a single descriptor are considered External
@@ -151,6 +170,12 @@ impl WolletDescriptor {
         self.inner_address(index, params, Chain::Internal)
     }
 
+    pub fn cipher(&self) -> Aes256GcmSiv {
+        let key_bytes = EncryptionKeyHash::hash(self.to_string().as_bytes()).to_byte_array();
+        let key = GenericArray::from_slice(&key_bytes);
+        Aes256GcmSiv::new(key)
+    }
+
     pub fn address(
         &self,
         index: u32,
@@ -186,5 +211,25 @@ impl WolletDescriptor {
 impl AsRef<ConfidentialDescriptor<DescriptorPublicKey>> for WolletDescriptor {
     fn as_ref(&self) -> &ConfidentialDescriptor<DescriptorPublicKey> {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    use crate::WolletDescriptor;
+
+    #[test]
+    fn test_wollet_hash() {
+        let desc_str = "ct(slip77(ab5824f4477b4ebb00a132adfd8eb0b7935cf24f6ac151add5d1913db374ce92),elwpkh([759db348/84'/1'/0']tpubDCRMaF33e44pcJj534LXVhFbHibPbJ5vuLhSSPFAw57kYURv4tzXFL6LSnd78bkjqdmE3USedkbpXJUPA1tdzKfuYSL7PianceqAhwL2UkA/<0;1>/*))#cch6wrnp";
+        let desc: WolletDescriptor = desc_str.parse().unwrap();
+        assert_eq!(desc_str, desc.to_string());
+        let mut hasher = DefaultHasher::new();
+        desc.hash(&mut hasher);
+        assert_eq!(12055616352728229988, hasher.finish());
     }
 }

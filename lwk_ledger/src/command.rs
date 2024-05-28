@@ -1,10 +1,10 @@
+use core::default::Default;
 /// APDU commands  for the Bitcoin application.
 ///
-use bitcoin::{
+use elements_miniscript::elements::bitcoin::{
     bip32::{ChildNumber, DerivationPath},
     consensus::encode::{self, VarInt},
 };
-use core::default::Default;
 
 use super::{
     apdu::{self, APDUCommand},
@@ -59,6 +59,54 @@ pub fn register_wallet(policy: &WalletPolicy) -> APDUCommand {
     APDUCommand {
         cla: apdu::Cla::Bitcoin as u8,
         ins: apdu::LiquidCommandCode::RegisterWallet as u8,
+        data,
+        ..Default::default()
+    }
+}
+
+/// Creates the APDU command required to retrieve an address for the given wallet.
+pub fn get_wallet_address(
+    policy: &WalletPolicy,
+    hmac: Option<&[u8; 32]>,
+    change: bool,
+    address_index: u32,
+    display: bool,
+) -> APDUCommand {
+    let mut data: Vec<u8> = Vec::with_capacity(70);
+    data.push(if display { 1_u8 } else { b'\0' });
+    data.extend_from_slice(&policy.id());
+    data.extend_from_slice(hmac.unwrap_or(&[b'\0'; 32]));
+    data.push(if change { 1_u8 } else { b'\0' });
+    data.extend_from_slice(&address_index.to_be_bytes());
+    APDUCommand {
+        cla: apdu::Cla::Bitcoin as u8,
+        ins: apdu::LiquidCommandCode::GetWalletAddress as u8,
+        data,
+        ..Default::default()
+    }
+}
+
+/// Creates the APDU command required to sign a psbt.
+pub fn sign_psbt(
+    global_mapping_commitment: &[u8],
+    inputs_number: usize,
+    input_commitments_root: &[u8; 32],
+    outputs_number: usize,
+    output_commitments_root: &[u8; 32],
+    policy: &WalletPolicy,
+    hmac: Option<&[u8; 32]>,
+) -> APDUCommand {
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(global_mapping_commitment);
+    data.extend(encode::serialize(&VarInt(inputs_number as u64)));
+    data.extend_from_slice(input_commitments_root);
+    data.extend(encode::serialize(&VarInt(outputs_number as u64)));
+    data.extend_from_slice(output_commitments_root);
+    data.extend_from_slice(&policy.id());
+    data.extend_from_slice(hmac.unwrap_or(&[b'\0'; 32]));
+    APDUCommand {
+        cla: apdu::Cla::Bitcoin as u8,
+        ins: apdu::LiquidCommandCode::SignPSBT as u8,
         data,
         ..Default::default()
     }

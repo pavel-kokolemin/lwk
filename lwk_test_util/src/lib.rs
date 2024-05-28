@@ -17,8 +17,11 @@ use elements::{Block, TxOutSecrets};
 use elements_miniscript::descriptor::checksum::desc_checksum;
 use elements_miniscript::{DescriptorPublicKey, ForEachKey};
 use lwk_common::Signer;
-use lwk_jade::register_multisig::{JadeDescriptor, RegisterMultisigParams};
+use lwk_jade::register_multisig::{
+    GetRegisteredMultisigParams, JadeDescriptor, RegisterMultisigParams,
+};
 use lwk_signer::*;
+use lwk_wollet::elements_miniscript::ConfidentialDescriptor;
 use lwk_wollet::*;
 use pulldown_cmark::{CodeBlockKind, Event, Tag};
 use rand::{thread_rng, Rng};
@@ -32,6 +35,7 @@ use tempfile::TempDir;
 use tracing::metadata::LevelFilter;
 
 pub mod jade;
+pub mod ledger;
 
 const DEFAULT_FEE_RATE: f32 = 100.0;
 
@@ -296,6 +300,10 @@ impl TestWollet {
         Self::with_temp_dir(electrs_url, desc, db_root_dir)
     }
 
+    pub fn with_test_desc(electrs_url: &str) -> Self {
+        Self::new(electrs_url, TEST_DESCRIPTOR)
+    }
+
     pub fn with_temp_dir(electrs_url: &str, desc: &str, db_root_dir: TempDir) -> Self {
         let tls = false;
         let validate_domain = false;
@@ -343,6 +351,10 @@ impl TestWollet {
 
     pub fn policy_asset(&self) -> AssetId {
         self.wollet.policy_asset()
+    }
+
+    pub fn tip(&self) -> Tip {
+        self.wollet.tip()
     }
 
     pub fn sync(&mut self) {
@@ -485,6 +497,39 @@ impl TestWollet {
             }
             true
         });
+    }
+
+    /// Send all L-BTC
+    pub fn send_all_btc(
+        &mut self,
+        signers: &[&AnySigner],
+        fee_rate: Option<f32>,
+        address: Address,
+    ) {
+        let balance_before = self.balance_btc();
+
+        let mut pset = self
+            .tx_builder()
+            .drain_lbtc_wallet()
+            .drain_lbtc_to(address)
+            .fee_rate(fee_rate)
+            .finish()
+            .unwrap();
+
+        let details = self.wollet.get_details(&pset).unwrap();
+        let fee = details.balance.fee as i64;
+        assert!(fee > 0);
+        assert_eq!(
+            *details.balance.balances.get(&self.policy_asset()).unwrap(),
+            -(balance_before as i64)
+        );
+
+        for signer in signers {
+            self.sign(signer, &mut pset);
+        }
+        self.send(&mut pset);
+        let balance_after = self.balance_btc();
+        assert_eq!(balance_after, 0);
     }
 
     pub fn send_asset(
@@ -815,6 +860,18 @@ impl TestWollet {
     pub fn network(&self) -> ElementsNetwork {
         self.wollet.network()
     }
+
+    pub fn wait_height(&mut self, height: u32) {
+        let mut electrum_client: ElectrumClient = ElectrumClient::new(&self.electrum_url).unwrap();
+        for _ in 0..120 {
+            full_scan_with_electrum_client(&mut self.wollet, &mut electrum_client).unwrap();
+            if self.wollet.tip().height() == height {
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        panic!("Wait for height {height} failed");
+    }
 }
 
 pub fn setup(enable_esplora_http: bool) -> TestElectrumServer {
@@ -906,17 +963,27 @@ pub fn multisig_desc(signers: &[&AnySigner], threshold: usize) -> String {
 
 pub fn register_multisig(signers: &[&AnySigner], name: &str, desc: &str) {
     // Register a multisig descriptor on each *jade* signer
-    let desc: WolletDescriptor = desc.parse().unwrap();
-    let desc: JadeDescriptor = desc.as_ref().try_into().unwrap();
+    let desc_orig: WolletDescriptor = desc.parse().unwrap();
+    let desc: JadeDescriptor = desc_orig.as_ref().try_into().unwrap();
     let params = RegisterMultisigParams {
         network: lwk_jade::Network::LocaltestLiquid,
         multisig_name: name.into(),
         descriptor: desc,
     };
 
+    let params_get = GetRegisteredMultisigParams {
+        multisig_name: name.into(),
+    };
+
     for signer in signers {
         if let AnySigner::Jade(s, _) = signer {
             s.register_multisig(params.clone()).unwrap();
+
+            let r = s.get_registered_multisig(params_get.clone()).unwrap();
+            let desc_elements =
+                ConfidentialDescriptor::<DescriptorPublicKey>::try_from(&r.descriptor).unwrap();
+            let desc_wollet = WolletDescriptor::try_from(desc_elements).unwrap();
+            assert_eq!(desc_orig.to_string(), desc_wollet.to_string());
         }
     }
 }
@@ -966,6 +1033,29 @@ pub fn tx_out_secrets_test_vector_bytes() -> Vec<u8> {
 
 pub fn update_test_vector_bytes() -> Vec<u8> {
     Vec::<u8>::from_hex(include_str!("../test_data/update_test_vector.hex")).unwrap()
+}
+
+pub fn update_test_vector_encrypted_bytes() -> Vec<u8> {
+    Vec::<u8>::from_hex(include_str!(
+        "../test_data/update_test_vector_encrypted.hex"
+    ))
+    .unwrap()
+}
+
+pub fn update_test_vector_encrypted_base64() -> String {
+    include_str!("../test_data/update_test_vector/update.base64").to_string()
+}
+
+pub fn update_test_vector_encrypted_bytes2() -> Vec<u8> {
+    include_bytes!("../test_data/update_test_vector/000000000000").to_vec()
+}
+
+pub fn wollet_descriptor_string2() -> String {
+    include_str!("../test_data/update_test_vector/desc").to_string()
+}
+
+pub fn wollet_descriptor_string() -> String {
+    include_str!("../test_data/update_test_vector/desc2").to_string()
 }
 
 #[cfg(test)]
