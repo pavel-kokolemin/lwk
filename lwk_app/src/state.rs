@@ -329,10 +329,6 @@ impl Wollets {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Wollet)> {
         self.0.iter()
     }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut Wollet)> {
-        self.0.iter_mut()
-    }
 }
 
 impl Signers {
@@ -358,7 +354,7 @@ impl Signers {
         timeout: Option<Duration>,
     ) -> Result<&AnySigner, Error> {
         let app_signer = self.get(name)?;
-        tracing::debug!("get_available({}) return {:?}", name, app_signer);
+        log::debug!("get_available({}) return {:?}", name, app_signer);
         let jade = match &app_signer.inner {
             #[cfg(not(feature = "serial"))]
             AppSignerInner::JadeId(_, _) => {

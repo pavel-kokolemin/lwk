@@ -2,6 +2,7 @@ use crate::descriptor::Chain;
 use crate::elements::{OutPoint, Script, Transaction, TxOutSecrets, Txid};
 use crate::error::Error;
 use crate::store::{Height, Timestamp};
+use crate::wollet::WolletState;
 use crate::{Wollet, WolletDescriptor};
 use aes_gcm_siv::aead::generic_array::GenericArray;
 use aes_gcm_siv::aead::AeadMutInPlace;
@@ -9,9 +10,9 @@ use base64::prelude::*;
 use elements::bitcoin::bip32::ChildNumber;
 use elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
 use elements::encode::{Decodable, Encodable};
-use elements::BlockHeader;
+use elements::{BlockHeader, TxInWitness, TxOutWitness};
 use rand::{thread_rng, Rng};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic;
 
 /// Transactions downloaded and unblinded
@@ -28,12 +29,34 @@ impl DownloadTxResult {
     fn is_empty(&self) -> bool {
         self.txs.is_empty() && self.unblinds.is_empty()
     }
+
+    fn prune(&mut self, scripts: &HashMap<Script, (Chain, ChildNumber)>) {
+        for (_, tx) in self.txs.iter_mut() {
+            for input in tx.input.iter_mut() {
+                input.witness = TxInWitness::empty();
+            }
+
+            for output in tx.output.iter_mut() {
+                if scripts.contains_key(&output.script_pubkey) {
+                    // we are keeping the rangeproof because it's needed for pset details
+                    output.witness.surjection_proof = None;
+                } else {
+                    output.witness = TxOutWitness::empty();
+                }
+            }
+        }
+    }
 }
 
 /// Passing a wallet to [`crate::BlockchainBackend::full_scan()`] returns this structure which
 /// contains the delta of information to be applied to the wallet to reach the latest status.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
+    /// The status of the wallet this update is generated from
+    ///
+    /// If 0 means it has been deserialized from a V0 version
+    pub wollet_status: u64,
+
     pub new_txs: DownloadTxResult,
     pub txid_height_new: Vec<(Txid, Option<Height>)>,
     pub txid_height_delete: Vec<Txid>,
@@ -48,6 +71,9 @@ impl Update {
             && self.txid_height_new.is_empty()
             && self.txid_height_delete.is_empty()
             && self.scripts.is_empty()
+    }
+    pub fn prune(&mut self, wallet: &Wollet) {
+        self.new_txs.prune(&wallet.store.cache.paths);
     }
     pub fn serialize(&self) -> Result<Vec<u8>, elements::encode::Error> {
         let mut vec = vec![];
@@ -116,8 +142,19 @@ impl Wollet {
     fn apply_update_inner(&mut self, update: Update, do_persist: bool) -> Result<(), Error> {
         // TODO should accept &Update
 
+        if update.wollet_status != 0 {
+            // wollet status 0 means the update has been created before saving the status (v0) and we can't check
+            if self.wollet_status() != update.wollet_status {
+                return Err(Error::UpdateOnDifferentStatus {
+                    wollet_status: self.wollet_status(),
+                    update_status: update.wollet_status,
+                });
+            }
+        }
+
         let store = &mut self.store;
         let Update {
+            wollet_status: _,
             new_txs,
             txid_height_new,
             txid_height_delete,
@@ -136,27 +173,12 @@ impl Wollet {
 
         store.cache.tip = (tip.height, tip.block_hash());
         store.cache.unblinded.extend(new_txs.unblinds);
-        let mut txids_unblinded: HashSet<Txid> =
-            store.cache.unblinded.keys().map(|o| o.txid).collect();
-        // Handle outgoing txs with no change output
-        for (txid, tx) in &new_txs.txs {
-            for i in &tx.input {
-                if store.cache.unblinded.contains_key(&i.previous_output) {
-                    txids_unblinded.insert(*txid);
-                }
-            }
-        }
         store.cache.all_txs.extend(new_txs.txs);
-        let txid_height: Vec<_> = txid_height_new
-            .iter()
-            .filter(|(txid, _)| txids_unblinded.contains(txid))
-            .cloned()
-            .collect();
         store
             .cache
             .heights
             .retain(|k, _| !txid_height_delete.contains(k));
-        store.cache.heights.extend(txid_height.clone());
+        store.cache.heights.extend(txid_height_new.clone());
         store.cache.timestamps.extend(timestamps);
         store
             .cache
@@ -165,9 +187,17 @@ impl Wollet {
         store.cache.paths.extend(scripts);
         let mut last_used_internal = None;
         let mut last_used_external = None;
-        for (txid, _) in txid_height {
+        for (txid, _) in txid_height_new {
             if let Some(tx) = store.cache.all_txs.get(&txid) {
-                for output in &tx.output {
+                for (vout, output) in tx.output.iter().enumerate() {
+                    if !store
+                        .cache
+                        .unblinded
+                        .contains_key(&OutPoint::new(txid, vout as u32))
+                    {
+                        // Output cannot be unblinded by wallet
+                        continue;
+                    }
                     if let Some((ext_int, ChildNumber::Normal { index })) =
                         store.cache.paths.get(&output.script_pubkey)
                     {
@@ -216,14 +246,14 @@ impl Encodable for DownloadTxResult {
         let mut bytes_written = 0;
 
         let txs_len = self.txs.len();
-        bytes_written += elements::VarInt(txs_len as u64).consensus_encode(&mut w)?;
+        bytes_written += elements::encode::VarInt(txs_len as u64).consensus_encode(&mut w)?;
         for (_txid, tx) in self.txs.iter() {
             // Avoid serializing Txid since are re-computable from the tx
             bytes_written += tx.consensus_encode(&mut w)?;
         }
 
         let unblinds_len = self.unblinds.len();
-        bytes_written += elements::VarInt(unblinds_len as u64).consensus_encode(&mut w)?;
+        bytes_written += elements::encode::VarInt(unblinds_len as u64).consensus_encode(&mut w)?;
         for (out_point, tx_out_secrets) in self.unblinds.iter() {
             bytes_written += out_point.consensus_encode(&mut w)?;
 
@@ -241,14 +271,14 @@ impl Encodable for DownloadTxResult {
 impl Decodable for DownloadTxResult {
     fn consensus_decode<D: std::io::Read>(mut d: D) -> Result<Self, elements::encode::Error> {
         let mut txs = vec![];
-        let txs_len = elements::VarInt::consensus_decode(&mut d)?.0;
+        let txs_len = elements::encode::VarInt::consensus_decode(&mut d)?.0;
         for _ in 0..txs_len {
             let tx = Transaction::consensus_decode(&mut d)?;
             txs.push((tx.txid(), tx));
         }
 
         let mut unblinds = vec![];
-        let unblinds_len = elements::VarInt::consensus_decode(&mut d)?.0;
+        let unblinds_len = elements::encode::VarInt::consensus_decode(&mut d)?.0;
         for _ in 0..unblinds_len {
             let out_point = OutPoint::consensus_decode(&mut d)?;
             let encodable_tx_out_secrets = EncodableTxOutSecrets::consensus_decode(&mut d)?;
@@ -319,30 +349,34 @@ impl Encodable for Update {
         let mut bytes_written = 0;
 
         bytes_written += UPDATE_MAGIC_BYTES.consensus_encode(&mut w)?; // Magic bytes
-        bytes_written += 0u8.consensus_encode(&mut w)?; // Version
+        bytes_written += 1u8.consensus_encode(&mut w)?; // Version
+
+        bytes_written += self.wollet_status.consensus_encode(&mut w)?;
 
         bytes_written += self.new_txs.consensus_encode(&mut w)?;
 
         bytes_written +=
-            elements::VarInt(self.txid_height_new.len() as u64).consensus_encode(&mut w)?;
+            elements::encode::VarInt(self.txid_height_new.len() as u64).consensus_encode(&mut w)?;
         for (txid, height) in self.txid_height_new.iter() {
             bytes_written += txid.consensus_encode(&mut w)?;
             bytes_written += height.unwrap_or(u32::MAX).consensus_encode(&mut w)?;
         }
 
-        bytes_written +=
-            elements::VarInt(self.txid_height_delete.len() as u64).consensus_encode(&mut w)?;
+        bytes_written += elements::encode::VarInt(self.txid_height_delete.len() as u64)
+            .consensus_encode(&mut w)?;
         for txid in self.txid_height_delete.iter() {
             bytes_written += txid.consensus_encode(&mut w)?;
         }
 
-        bytes_written += elements::VarInt(self.timestamps.len() as u64).consensus_encode(&mut w)?;
+        bytes_written +=
+            elements::encode::VarInt(self.timestamps.len() as u64).consensus_encode(&mut w)?;
         for (height, timestamp) in self.timestamps.iter() {
             bytes_written += height.consensus_encode(&mut w)?;
             bytes_written += timestamp.consensus_encode(&mut w)?;
         }
 
-        bytes_written += elements::VarInt(self.scripts.len() as u64).consensus_encode(&mut w)?;
+        bytes_written +=
+            elements::encode::VarInt(self.scripts.len() as u64).consensus_encode(&mut w)?;
         for (script, (chain, child_number)) in self.scripts.iter() {
             bytes_written += script.consensus_encode(&mut w)?;
             bytes_written += match chain {
@@ -367,14 +401,19 @@ impl Decodable for Update {
         }
 
         let version = u8::consensus_decode(&mut d)?;
-        if version != 0 {
+        if version > 1 {
             return Err(elements::encode::Error::ParseFailed("Unsupported version"));
         }
+        let wollet_status = if version == 1 {
+            u64::consensus_decode(&mut d)?
+        } else {
+            0
+        };
 
         let new_txs = DownloadTxResult::consensus_decode(&mut d)?;
 
         let txid_height_new = {
-            let len = elements::VarInt::consensus_decode(&mut d)?.0;
+            let len = elements::encode::VarInt::consensus_decode(&mut d)?.0;
             let mut vec = Vec::with_capacity(len as usize);
             for _ in 0..len {
                 let txid = Txid::consensus_decode(&mut d)?;
@@ -388,7 +427,7 @@ impl Decodable for Update {
         };
 
         let txid_height_delete = {
-            let len = elements::VarInt::consensus_decode(&mut d)?.0;
+            let len = elements::encode::VarInt::consensus_decode(&mut d)?.0;
             let mut vec = Vec::with_capacity(len as usize);
             for _ in 0..len {
                 vec.push(Txid::consensus_decode(&mut d)?);
@@ -397,7 +436,7 @@ impl Decodable for Update {
         };
 
         let timestamps = {
-            let len = elements::VarInt::consensus_decode(&mut d)?.0;
+            let len = elements::encode::VarInt::consensus_decode(&mut d)?.0;
             let mut vec = Vec::with_capacity(len as usize);
             for _ in 0..len {
                 let h = u32::consensus_decode(&mut d)?;
@@ -408,7 +447,7 @@ impl Decodable for Update {
         };
 
         let scripts = {
-            let len = elements::VarInt::consensus_decode(&mut d)?.0;
+            let len = elements::encode::VarInt::consensus_decode(&mut d)?.0;
             let mut map = HashMap::with_capacity(len as usize);
             for _ in 0..len {
                 let script = Script::consensus_decode(&mut d)?;
@@ -426,6 +465,7 @@ impl Decodable for Update {
         let tip = BlockHeader::consensus_decode(&mut d)?;
 
         Ok(Self {
+            wollet_status,
             new_txs,
             txid_height_new,
             txid_height_delete,
@@ -443,10 +483,11 @@ mod test {
 
     use elements::{
         encode::{Decodable, Encodable},
+        hex::ToHex,
         Script,
     };
 
-    use crate::{update::DownloadTxResult, Chain, Update, WolletDescriptor};
+    use crate::{update::DownloadTxResult, Chain, Update, Wollet, WolletDescriptor};
 
     use super::EncodableTxOutSecrets;
 
@@ -473,6 +514,7 @@ mod test {
             timestamps: Default::default(),
             scripts: Default::default(),
             tip,
+            wollet_status: 1,
         };
         assert!(update.only_tip());
         update
@@ -525,16 +567,33 @@ mod test {
             timestamps: vec![(12, 44), (12, 44)],
             scripts,
             tip,
+            wollet_status: 1,
         };
 
         let mut vec = vec![];
         let len = update.consensus_encode(&mut vec).unwrap();
-        assert_eq!(vec, lwk_test_util::update_test_vector_bytes());
-        assert_eq!(len, 2842);
+        std::fs::write("/tmp/xx.hex", vec.to_hex()).unwrap();
+        let exp_vec = lwk_test_util::update_test_vector_v1_bytes();
+        assert_eq!(vec, exp_vec);
+        assert_eq!(len, 2850);
         assert_eq!(vec.len(), len);
 
         let back = Update::consensus_decode(&vec[..]).unwrap();
         assert_eq!(update, back)
+    }
+
+    #[test]
+    fn test_update_backward_comp() {
+        // Update can be deserialize from v0 or v1 blob, but in the first case the wallet_status will be 0.
+        let v0 = lwk_test_util::update_test_vector_bytes();
+        let v1 = lwk_test_util::update_test_vector_v1_bytes();
+
+        let upd_from_v0 = Update::deserialize(&v0).unwrap();
+
+        let mut upd_from_v1 = Update::deserialize(&v1).unwrap();
+        assert_ne!(upd_from_v0, upd_from_v1);
+        upd_from_v1.wollet_status = 0;
+        assert_eq!(upd_from_v0, upd_from_v1);
     }
 
     #[test]
@@ -561,5 +620,22 @@ mod test {
 
         let back = Update::deserialize_decrypted_base64(&update_ser, &desc).unwrap();
         assert_eq!(update, back)
+    }
+
+    #[test]
+    fn test_update_prune() {
+        let update_bytes = lwk_test_util::update_test_vector_2_bytes();
+        let update = Update::deserialize(&update_bytes).unwrap();
+        let desc: WolletDescriptor = lwk_test_util::wollet_descriptor_string().parse().unwrap();
+        let wollet = Wollet::without_persist(crate::ElementsNetwork::LiquidTestnet, desc).unwrap();
+        assert_eq!(update.serialize().unwrap().len(), 18444);
+        let update_pruned = {
+            let mut u = update.clone();
+            u.prune(&wollet);
+            u
+        };
+        assert_eq!(update_pruned.serialize().unwrap().len(), 1114);
+        assert_eq!(update.new_txs.txs.len(), update_pruned.new_txs.txs.len());
+        assert_eq!(update.new_txs.unblinds, update_pruned.new_txs.unblinds);
     }
 }

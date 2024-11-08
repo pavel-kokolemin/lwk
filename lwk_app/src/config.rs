@@ -1,3 +1,5 @@
+use lwk_common::electrum_ssl::LIQUID_SOCKET;
+use lwk_common::electrum_ssl::LIQUID_TESTNET_SOCKET;
 use lwk_jade::Network as JadeNetwork;
 use lwk_jade::TIMEOUT;
 use lwk_wollet::elements::AssetId;
@@ -35,7 +37,7 @@ impl Config {
         Self {
             addr: consts::DEFAULT_ADDR.into(),
             datadir,
-            electrum_url: "blockstream.info:465".into(),
+            electrum_url: LIQUID_TESTNET_SOCKET.into(),
             network: ElementsNetwork::LiquidTestnet,
             tls: true,
             validate_domain: true,
@@ -51,7 +53,7 @@ impl Config {
         Self {
             addr: consts::DEFAULT_ADDR.into(),
             datadir,
-            electrum_url: "blockstream.info:995".into(),
+            electrum_url: LIQUID_SOCKET.into(),
             network: ElementsNetwork::Liquid,
             tls: true,
             validate_domain: true,
@@ -119,12 +121,15 @@ impl Config {
         matches!(self.network, ElementsNetwork::Liquid)
     }
 
-    fn electrum_url(&self) -> lwk_wollet::ElectrumUrl {
-        lwk_wollet::ElectrumUrl::new(&self.electrum_url, self.tls, self.validate_domain)
+    fn electrum_url(&self) -> Result<lwk_wollet::ElectrumUrl, Error> {
+        Ok(
+            lwk_wollet::ElectrumUrl::new(&self.electrum_url, self.tls, self.validate_domain)
+                .map_err(lwk_wollet::Error::Url)?,
+        )
     }
 
     pub fn electrum_client(&self) -> Result<lwk_wollet::ElectrumClient, Error> {
         // TODO cache it instead of recreating every time
-        Ok(lwk_wollet::ElectrumClient::new(&self.electrum_url())?)
+        Ok(lwk_wollet::ElectrumClient::new(&self.electrum_url()?)?)
     }
 }

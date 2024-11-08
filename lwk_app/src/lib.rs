@@ -17,7 +17,7 @@ use std::num::NonZeroU8;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 
 use lwk_common::{
@@ -40,7 +40,7 @@ use lwk_wollet::elements::{Address, AssetId, Txid};
 use lwk_wollet::elements_miniscript::descriptor::{Descriptor, DescriptorType, WshInner};
 use lwk_wollet::elements_miniscript::miniscript::decode::Terminal;
 use lwk_wollet::elements_miniscript::{DescriptorPublicKey, ForEachKey};
-use lwk_wollet::{full_scan_with_electrum_client, Wollet};
+use lwk_wollet::Wollet;
 use lwk_wollet::{BlockchainBackend, WolletDescriptor};
 use serde_json::Value;
 
@@ -76,7 +76,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Result<App, Error> {
-        tracing::info!("Creating new app with config: {:?}", config);
+        log::info!("Creating new app with config: {:?}", config);
 
         Ok(App {
             rpc: None,
@@ -124,7 +124,7 @@ impl App {
         let path = self.config.state_path()?;
         match std::fs::read_to_string(&path) {
             Ok(string) => {
-                tracing::info!(
+                log::info!(
                     "Loading previous state, {} elements",
                     string.lines().count()
                 );
@@ -138,7 +138,7 @@ impl App {
                 }
             }
             Err(_) => {
-                tracing::info!("There is no previous state at {path:?}");
+                log::info!("There is no previous state at {path:?}");
             }
         }
         state.lock().map_err(|e| e.to_string())?.do_persist = true;
@@ -171,17 +171,51 @@ impl App {
                 interval = interval.saturating_sub(stop_interval);
             }
 
-            if let Ok(mut s) = state_scanning.lock() {
+            let (wollets_names, config) = {
+                let mut s = state_scanning.lock().expect("state lock poison");
                 s.interrupt_wait = false;
                 s.scan_loops_started += 1;
-                if let Ok(mut electrum_client) = s.config.electrum_client() {
-                    for (_name, wollet) in s.wollets.iter_mut() {
-                        // TODO: release lock when doing network calls
-                        let _ = full_scan_with_electrum_client(wollet, &mut electrum_client);
+                let wollets_names: Vec<_> = s.wollets.iter().map(|e| e.0.to_owned()).collect();
+                let config = s.config.clone();
+                (wollets_names, config)
+            };
+
+            match config.electrum_client() {
+                Ok(mut electrum_client) => {
+                    for name in wollets_names {
+                        let state = match state_scanning
+                            .lock()
+                            .expect("state lock poison")
+                            .wollets
+                            .get(&name)
+                        {
+                            Ok(w) => w.state(),
+                            Err(_) => continue,
+                        };
+
+                        match electrum_client.full_scan(&state) {
+                            Ok(Some(update)) => {
+                                let mut s = state_scanning.lock().expect("state lock poison");
+                                let _ = match s.wollets.get_mut(&name) {
+                                    Ok(wollet) => wollet.apply_update(update),
+                                    Err(_) => continue,
+                                };
+                            }
+                            Ok(None) => (),
+                            Err(_) => continue,
+                        }
                     }
                 }
-                s.scan_loops_completed += 1;
-            }
+                Err(_) => {
+                    log::info!(
+                        "Cannot create an electrum client, are we conected? Retrying in one sec"
+                    );
+                    sleep(Duration::from_secs(1))
+                }
+            };
+
+            let mut s = state_scanning.lock().expect("state lock poison");
+            s.scan_loops_completed += 1;
         });
         self.scanning_handle = Some(scanning_handle);
 
@@ -234,7 +268,7 @@ fn method_handler(
 }
 
 fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Response, Error> {
-    tracing::debug!(
+    log::debug!(
         "method: {} params: {:?} ",
         request.method.as_str(),
         request.params
@@ -280,6 +314,9 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             // TODO recognize different name same descriptor?
 
             let desc: WolletDescriptor = r.descriptor.parse()?;
+            if desc.is_mainnet() != s.config.is_mainnet() {
+                return Err(Error::Generic("Descriptor is for the wrong network".into()));
+            }
             let wollet = Wollet::with_fs_persist(s.config.network, desc, &s.config.datadir)?;
             s.wollets.insert(&r.name, wollet)?;
 
@@ -508,11 +545,14 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .into_iter()
                 .map(unvalidated_addressee)
                 .collect();
-            let mut tx = wollet
+            let mut builder = wollet
                 .tx_builder()
                 .set_unvalidated_recipients(&recipients)?
-                .fee_rate(r.fee_rate)
-                .finish()?;
+                .fee_rate(r.fee_rate);
+            if r.enable_ct_discount {
+                builder = builder.enable_ct_discount();
+            }
+            let mut tx = builder.finish()?;
 
             add_contracts(&mut tx, s.assets.iter());
             Response::result(
@@ -1050,7 +1090,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 let s = state.lock()?;
                 (s.config.jade_network(), Some(s.config.timeout))
             };
-            tracing::debug!("jade network: {}", network);
+            log::debug!("jade network: {}", network);
 
             let jade = match r.emulator {
                 Some(emulator) => Jade::from_socket(emulator, network)?,
@@ -1095,7 +1135,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 let url = &s.config.registry_url;
                 let contract = asset.contract();
                 let data = serde_json::json!({"asset_id": asset_id, "contract": contract});
-                tracing::debug!("posting {data:?} as json to {url} ");
+                log::debug!("posting {data:?} as json to {url} ");
                 let response = client.post(url).json(&data).send()?;
                 let mut result = response.text()?;
                 if result.contains("failed verifying linked entity") {
@@ -1241,7 +1281,6 @@ mod tests {
         let mut app = app_random_port();
         let addr = app.addr();
         let url = addr.to_string();
-        dbg!(&url);
 
         let client = jsonrpc::Client::simple_http(&url, None, None).unwrap();
         let request = client.build_request("version", None);

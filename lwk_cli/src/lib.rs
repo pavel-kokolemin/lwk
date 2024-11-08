@@ -9,9 +9,9 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use clap::CommandFactory;
+use env_logger::Env;
 use lwk_app::Config;
 use serde_json::Value;
-use tracing_subscriber::{filter::LevelFilter, EnvFilter, FmtSubscriber};
 
 use crate::args::{AssetCommand, CliCommand, Network, ServerCommand, SignerCommand, WalletCommand};
 pub use args::Cli;
@@ -28,25 +28,18 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
         command: ServerCommand::Start { .. },
     }) = args.command
     {
-        LevelFilter::INFO.into()
+        "info"
     } else {
-        LevelFilter::WARN.into()
+        "warn"
     };
+    let mut builder = env_logger::Builder::from_env(Env::default().default_filter_or(directive));
 
-    let (appender, _guard) = tracing_appender::non_blocking(std::io::stderr());
-    let filter = EnvFilter::builder()
-        .with_default_directive(directive)
-        .from_env_lossy();
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_writer(appender)
-        .finish();
-    match tracing::subscriber::set_global_default(subscriber) {
-        Ok(_) => tracing::info!("logging initialized"),
-        Err(_) => tracing::debug!("logging already initialized"),
+    match builder.try_init() {
+        Ok(_) => log::info!("logging initialized"),
+        Err(_) => log::debug!("logging already initialized"),
     }
 
-    tracing::info!("CLI initialized with args: {:?}", args);
+    log::info!("CLI initialized with args: {:?}", args);
 
     // TODO: improve network types conversion or comparison
     let (network, default_port) = match args.network {
@@ -127,19 +120,19 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
 
                     // get the app version
                     let version = client.version()?.version;
-                    tracing::info!("App running version {}", version);
+                    log::info!("App running version {}", version);
 
                     loop {
                         match rx.recv_timeout(Duration::from_millis(100)) {
                             Ok(_) => {
-                                tracing::debug!("Received ctrl-c signal");
+                                log::debug!("Received ctrl-c signal");
                                 break;
                             }
                             Err(_) => {
                                 if app.is_running().unwrap_or(false) {
                                     continue;
                                 } else {
-                                    tracing::debug!("Received stop signal");
+                                    log::debug!("Received stop signal");
                                     break;
                                 }
                             }
@@ -147,7 +140,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     }
                     app.stop()?;
                     app.join_threads()?;
-                    tracing::info!("Threads ended");
+                    log::info!("Threads ended");
                 }
                 ServerCommand::Scan => {
                     client.scan()?;
@@ -246,6 +239,7 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                 wallet,
                 recipient,
                 fee_rate,
+                enable_ct_discount,
             } => {
                 let mut addressees = vec![];
                 for rec in recipient {
@@ -255,7 +249,8 @@ pub fn inner_main(args: args::Cli) -> anyhow::Result<Value> {
                     );
                 }
 
-                let r = client.wallet_send_many(wallet, addressees, fee_rate)?;
+                let r =
+                    client.wallet_send_many(wallet, addressees, fee_rate, enable_ct_discount)?;
                 serde_json::to_value(r)?
             }
             WalletCommand::Drain {

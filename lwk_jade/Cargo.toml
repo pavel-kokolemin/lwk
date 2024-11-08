@@ -1,6 +1,6 @@
 [package]
 name = "lwk_jade"
-version = "0.5.1"
+version = "0.8.0"
 edition = "2021"
 autotests = false
 description = "Liquid Wallet Kit - Interact with the Blockstream Jade Hardware Wallet"
@@ -8,7 +8,10 @@ license = "MIT OR BSD-2-Clause"
 documentation = "https://docs.rs/lwk_jade"
 
 [dependencies]
-lwk_common = { version = "0.5" }
+lwk_common = { version = "0.8.0" }
+lwk_containers = { version = "0.8.0", optional = true }
+
+tempfile = { version = "3.8.0", optional = true }
 
 # anyhow = "1"
 serde_cbor = "0.11.2"
@@ -17,13 +20,13 @@ rand = "0.8.5"
 serde = "1"
 serde_bytes = "0.11.12"
 serde_json = "1"
-elements = { version = "0.24.0", features = ["base64", "serde"] }
+elements = { version = "0.25.0", features = ["base64", "serde"] }
 serialport = { version = "4.2.1", optional = true }
 thiserror = "1"
 
-tracing = "0.1"
+log.workspace = true
 
-elements-miniscript = "0.3"
+elements-miniscript = "0.4"
 
 reqwest = { version = "0.12", default-features = false, features = [
     "charset",
@@ -43,23 +46,23 @@ tokio = { version = "1.36.0", features = [
 wasm-timer = "0.2.5"
 
 [features]
-default = ["sync"]
+default = ["sync", "test_emulator"]
 sync = []
 serial = ["serialport"]
 asyncr = ["tokio"]
+test_emulator = ["lwk_containers", "tempfile"]
 
 [[test]]
 name = "e2e"
 path = "tests/e2e.rs"
 
 [dev-dependencies]
-lwk_test_util = { version = "0.4" }
-lwk_containers = { version = "0.3" }
+lwk_test_util = { version = "0.8.0" }
+lwk_containers = { version = "0.8.0" }
 
 tempfile = "3.8.0"
 base64 = "0.21.4"
 serde_json = "1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.docs.rs]
 all-features = true

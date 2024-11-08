@@ -1,40 +1,88 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
+use age::x25519::Recipient;
 use elements::{
+    bitcoin::bip32::ChildNumber,
     encode::Decodable,
     hashes::{hex::FromHex, sha256, Hash},
     hex::ToHex,
     pset::serialize::Serialize,
     BlockHash, Script, Txid,
 };
-use reqwest::blocking::Response;
+use elements_miniscript::DescriptorPublicKey;
+use reqwest::blocking::{self, Response};
 use serde::Deserialize;
 
-use crate::{store::Height, BlockchainBackend, Error};
-
-use super::History;
+use crate::{
+    clients::waterfalls::{encrypt, WaterfallsResult},
+    clients::{Capability, Data, History},
+    store::Height,
+    wollet::WolletState,
+    BlockchainBackend, Chain, Error, WolletDescriptor,
+};
 
 #[derive(Debug)]
 /// A blockchain backend implementation based on the
 /// [esplora HTTP API](https://github.com/blockstream/esplora/blob/master/API.md)
 pub struct EsploraClient {
+    client: blocking::Client,
     base_url: String,
     tip_hash_url: String,
     broadcast_url: String,
+
+    waterfalls: bool,
+    waterfalls_server_recipient: Option<Recipient>,
+    waterfalls_avoid_encryption: bool,
 }
 
 impl EsploraClient {
     pub fn new(url: &str) -> Self {
         Self {
+            client: blocking::Client::new(),
             base_url: url.to_string(),
             tip_hash_url: format!("{url}/blocks/tip/hash"),
             broadcast_url: format!("{url}/tx"),
+            waterfalls: false,
+            waterfalls_server_recipient: None,
+            waterfalls_avoid_encryption: false,
         }
     }
 
     fn last_block_hash(&mut self) -> Result<elements::BlockHash, crate::Error> {
-        let response = get_with_retry(&self.tip_hash_url, 0)?;
+        let response = get_with_retry(&self.client, &self.tip_hash_url, 0)?;
         Ok(BlockHash::from_str(&response.text()?)?)
+    }
+}
+
+/// "Waterfalls" methods
+impl EsploraClient {
+    /// Create a new Esplora client using the "waterfalls" endpoint
+    pub fn new_waterfalls(url: &str) -> Self {
+        let mut client = Self::new(url);
+        client.waterfalls = true;
+        client
+    }
+
+    /// Do not encrypt the descriptor when using the "waterfalls" endpoint
+    pub fn waterfalls_avoid_encryption(&mut self) {
+        self.waterfalls_avoid_encryption = true;
+    }
+
+    fn waterfalls_server_recipient(&mut self) -> Result<Recipient, Error> {
+        match self.waterfalls_server_recipient.as_ref() {
+            Some(r) => Ok(r.clone()),
+            None => {
+                let url = format!("{}/v1/server_recipient", self.base_url);
+                let response = self.client.get(url).send()?;
+                let rec = Recipient::from_str(&response.text()?)
+                    .map_err(|_| Error::CannotParseRecipientKey)?;
+                self.waterfalls_server_recipient = Some(rec.clone());
+                Ok(rec)
+            }
+        }
     }
 }
 
@@ -43,7 +91,7 @@ impl BlockchainBackend for EsploraClient {
         let last_block_hash = self.last_block_hash()?;
 
         let header_url = format!("{}/block/{}/header", self.base_url, last_block_hash);
-        let response = get_with_retry(&header_url, 0)?;
+        let response = get_with_retry(&self.client, &header_url, 0)?;
         let header_bytes = Vec::<u8>::from_hex(&response.text()?)?;
 
         let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
@@ -51,9 +99,8 @@ impl BlockchainBackend for EsploraClient {
     }
 
     fn broadcast(&self, tx: &elements::Transaction) -> Result<elements::Txid, crate::Error> {
-        let tx_bytes = tx.serialize();
-        let client = reqwest::blocking::Client::new();
-        let response = client.post(&self.broadcast_url).body(tx_bytes).send()?;
+        let tx_hex = tx.serialize().to_hex();
+        let response = self.client.post(&self.broadcast_url).body(tx_hex).send()?;
         let txid = elements::Txid::from_str(&response.text()?)?;
         Ok(txid)
     }
@@ -62,7 +109,7 @@ impl BlockchainBackend for EsploraClient {
         let mut result = vec![];
         for txid in txids.iter() {
             let tx_url = format!("{}/tx/{}/raw", self.base_url, txid);
-            let response = get_with_retry(&tx_url, 0)?;
+            let response = get_with_retry(&self.client, &tx_url, 0)?;
             let tx = elements::Transaction::consensus_decode(&response.bytes()?[..])?;
             result.push(tx);
         }
@@ -80,13 +127,13 @@ impl BlockchainBackend for EsploraClient {
                 Some(block_hash) => *block_hash,
                 None => {
                     let block_height = format!("{}/block-height/{}", self.base_url, height);
-                    let response = get_with_retry(&block_height, 0)?;
+                    let response = get_with_retry(&self.client, &block_height, 0)?;
                     BlockHash::from_str(&response.text()?)?
                 }
             };
 
             let block_header = format!("{}/block/{}/header", self.base_url, block_hash);
-            let response = get_with_retry(&block_header, 0)?;
+            let response = get_with_retry(&self.client, &block_header, 0)?;
             let header_bytes = Vec::<u8>::from_hex(&response.text()?)?;
 
             let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
@@ -106,20 +153,123 @@ impl BlockchainBackend for EsploraClient {
             let script_hash = sha256::Hash::hash(script.as_bytes()).to_byte_array();
             let url = format!("{}/scripthash/{}/txs", self.base_url, script_hash.to_hex());
             // TODO must handle paging -> https://github.com/blockstream/esplora/blob/master/API.md#addresses
-            let response = get_with_retry(&url, 0)?;
-            let json: Vec<EsploraTx> = response.json()?;
+
+            let response = get_with_retry(&self.client, &url, 0)?;
+
+            // TODO going through string and then json is not as efficient as it could be but we prioritize debugging for now
+            let text = response.text()?;
+            let json: Vec<EsploraTx> = match serde_json::from_str(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("error {e:?} in converting following text:\n{text}");
+                    return Err(e.into());
+                }
+            };
 
             let history: Vec<History> = json.into_iter().map(Into::into).collect();
             result.push(history)
         }
         Ok(result)
     }
+
+    fn capabilities(&self) -> HashSet<Capability> {
+        if self.waterfalls {
+            vec![Capability::Waterfalls].into_iter().collect()
+        } else {
+            HashSet::new()
+        }
+    }
+
+    fn get_history_waterfalls<S: WolletState>(
+        &mut self,
+        descriptor: &WolletDescriptor,
+        state: &S,
+    ) -> Result<Data, Error> {
+        let descriptor_url = format!("{}/v1/waterfalls", self.base_url);
+        if descriptor.is_elip151() {
+            return Err(Error::UsingWaterfallsWithElip151);
+        }
+        let desc = descriptor.bitcoin_descriptor_without_key_origin();
+        let desc = if self.waterfalls_avoid_encryption {
+            desc
+        } else {
+            let recipient = self.waterfalls_server_recipient()?;
+
+            // TODO ideally the encrypted descriptor should be cached and reused, so that caching can be leveraged
+            encrypt(&desc, recipient)?
+        };
+
+        let response = self
+            .client
+            .get(descriptor_url)
+            .query(&[("descriptor", desc)])
+            .send()?;
+        let status = response.status().as_u16();
+        let body = response.text()?;
+
+        if status != 200 {
+            return Err(Error::Generic(body));
+        }
+
+        let waterfalls_result: WaterfallsResult = serde_json::from_str(&body)?;
+        let mut data = Data::default();
+
+        for (desc, chain_history) in waterfalls_result.txs_seen.iter() {
+            let desc: elements_miniscript::Descriptor<DescriptorPublicKey> = desc.parse()?;
+            let chain: Chain = (&desc)
+                .try_into()
+                .map_err(|_| Error::Generic("Cannot determine chain from desc".into()))?;
+            let max = chain_history
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(i, _)| i as u32)
+                .max();
+            if let Some(max) = max {
+                data.last_unused[chain] = max + 1;
+            }
+            for (i, script_history) in chain_history.iter().enumerate() {
+                // TODO handle paging by asking following pages if there are more than 1000 results
+                let child = ChildNumber::from(waterfalls_result.page as u32 * 1000 + i as u32);
+                let (script, cached) = state.get_or_derive(chain, child, &desc)?;
+                if !cached {
+                    data.scripts.insert(script, (chain, child));
+                }
+                for tx_seen in script_history {
+                    let height = if tx_seen.height > 0 {
+                        Some(tx_seen.height as u32)
+                    } else {
+                        None
+                    };
+                    if let Some(height) = height.as_ref() {
+                        if let Some(block_hash) = tx_seen.block_hash.as_ref() {
+                            data.height_blockhash.insert(*height, *block_hash);
+                        }
+                        if let Some(ts) = tx_seen.block_timestamp.as_ref() {
+                            data.height_timestamp.insert(*height, *ts);
+                        }
+                    }
+
+                    data.txid_height.insert(tx_seen.txid, height);
+                }
+            }
+        }
+
+        Ok(data)
+    }
 }
 
-fn get_with_retry(url: &str, attempt: usize) -> Result<Response, Error> {
-    let response = reqwest::blocking::get(url)?;
-    tracing::debug!(
-        "{} status_code:{} body bytes:{:?}",
+fn get_with_retry(client: &blocking::Client, url: &str, attempt: usize) -> Result<Response, Error> {
+    let response = client.get(url).send()?;
+
+    let level = if response.status() == 200 {
+        log::Level::Trace
+    } else {
+        log::Level::Info
+    };
+    log::log!(
+        level,
+        "{} status_code:{} - body bytes:{:?}",
         &url,
         response.status(),
         response.content_length(),
@@ -129,13 +279,15 @@ fn get_with_retry(url: &str, attempt: usize) -> Result<Response, Error> {
     // 503 Service Temporarily Unavailable
     if response.status() == 429 || response.status() == 503 {
         if attempt > 6 {
+            log::warn!("{url} tried 6 times, failing");
             return Err(Error::Generic("Too many retry".to_string()));
         }
         let secs = 1 << attempt;
 
-        tracing::debug!("waiting {secs}");
+        log::debug!("{url} waiting {secs}");
+
         std::thread::sleep(std::time::Duration::from_secs(secs));
-        get_with_retry(url, attempt + 1)
+        get_with_retry(client, url, attempt + 1)
     } else {
         Ok(response)
     }
@@ -145,8 +297,9 @@ impl From<EsploraTx> for History {
     fn from(value: EsploraTx) -> Self {
         History {
             txid: value.txid,
-            height: value.status.block_height,
-            block_hash: Some(value.status.block_hash),
+            height: value.status.block_height.unwrap_or(-1),
+            block_hash: value.status.block_hash,
+            block_timestamp: None,
         }
     }
 }
@@ -161,8 +314,8 @@ struct EsploraTx {
 
 #[derive(Deserialize)]
 struct Status {
-    block_height: i32,
-    block_hash: BlockHash,
+    block_height: Option<i32>,
+    block_hash: Option<BlockHash>,
 }
 
 #[cfg(test)]
@@ -182,7 +335,7 @@ mod tests {
     #[ignore = "Should be integration test, but it is testing private function"]
     #[test]
     fn esplora_local() {
-        let server = lwk_test_util::setup(true);
+        let server = lwk_test_util::setup_with_esplora();
 
         let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
         test_esplora_url(&esplora_url);

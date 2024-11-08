@@ -1,5 +1,5 @@
-use crate::{types::AssetId, LwkError, Transaction};
-use elements::pset::PartiallySignedTransaction;
+use crate::{types::AssetId, LwkError, Script, Transaction, Txid};
+use elements::pset::{Input, PartiallySignedTransaction};
 use std::{fmt::Display, sync::Arc};
 
 /// Partially Signed Elements Transaction, wrapper over [`elements::pset::PartiallySignedTransaction`]
@@ -35,23 +35,73 @@ impl Pset {
         Ok(Arc::new(tx))
     }
 
-    pub fn issuance_asset(&self, index: u32) -> Option<AssetId> {
-        self.issuances_ids(index).map(|e| e.0)
-    }
-
-    pub fn issuance_token(&self, index: u32) -> Option<AssetId> {
-        self.issuances_ids(index).map(|e| e.1)
+    pub fn inputs(&self) -> Vec<Arc<PsetInput>> {
+        self.inner
+            .inputs()
+            .iter()
+            .map(|i| Arc::new(i.clone().into()))
+            .collect()
     }
 }
 
 impl Pset {
-    fn issuances_ids(&self, index: u32) -> Option<(AssetId, AssetId)> {
-        let issuance_ids = self.inner.inputs().get(index as usize)?.issuance_ids();
-        Some((issuance_ids.0.into(), issuance_ids.1.into()))
-    }
-
     pub(crate) fn inner(&self) -> PartiallySignedTransaction {
         self.inner.clone()
+    }
+}
+
+/// PSET input
+#[derive(uniffi::Object, Debug)]
+pub struct PsetInput {
+    inner: Input,
+}
+
+impl From<Input> for PsetInput {
+    fn from(inner: Input) -> Self {
+        Self { inner }
+    }
+}
+
+#[uniffi::export]
+impl PsetInput {
+    /// Prevout TXID of the input
+    pub fn previous_txid(&self) -> Arc<Txid> {
+        Arc::new(self.inner.previous_txid.into())
+    }
+
+    /// Prevout vout of the input
+    pub fn previous_vout(&self) -> u32 {
+        self.inner.previous_output_index
+    }
+
+    /// Prevout scriptpubkey of the input
+    pub fn previous_script_pubkey(&self) -> Option<Arc<Script>> {
+        self.inner
+            .witness_utxo
+            .as_ref()
+            .map(|txout| Arc::new(txout.script_pubkey.clone().into()))
+    }
+
+    /// Redeem script of the input
+    pub fn redeem_script(&self) -> Option<Arc<Script>> {
+        self.inner
+            .redeem_script
+            .as_ref()
+            .map(|s| Arc::new(s.clone().into()))
+    }
+
+    /// If the input has an issuance, the asset id
+    pub fn issuance_asset(&self) -> Option<AssetId> {
+        self.inner
+            .has_issuance()
+            .then(|| self.inner.issuance_ids().0.into())
+    }
+
+    /// If the input has an issuance, the token id
+    pub fn issuance_token(&self) -> Option<AssetId> {
+        self.inner
+            .has_issuance()
+            .then(|| self.inner.issuance_ids().1.into())
     }
 }
 
@@ -67,9 +117,20 @@ mod tests {
 
         let tx_expected =
             include_str!("../../lwk_jade/test_data/pset_to_be_signed_transaction.hex").to_string();
-        let tx_string = pset.extract_tx().unwrap().to_string();
-        assert_eq!(tx_expected, tx_string);
+        let tx = pset.extract_tx().unwrap();
+        assert_eq!(tx_expected, tx.to_string());
 
         assert_eq!(pset_string, pset.to_string());
+
+        assert_eq!(pset.inputs().len(), tx.inputs().len());
+        let pset_in = &pset.inputs()[0];
+        let tx_in = &tx.inputs()[0];
+        assert_eq!(pset_in.previous_txid(), tx_in.outpoint().txid());
+        assert_eq!(pset_in.previous_vout(), tx_in.outpoint().vout());
+        assert!(pset_in.previous_script_pubkey().is_some());
+        assert!(pset_in.redeem_script().is_none());
+
+        assert!(pset_in.issuance_asset().is_none());
+        assert!(pset_in.issuance_token().is_none());
     }
 }

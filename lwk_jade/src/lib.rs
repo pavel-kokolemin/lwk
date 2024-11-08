@@ -13,6 +13,12 @@ pub mod protocol;
 pub mod register_multisig;
 pub mod sign_liquid_tx;
 
+#[cfg(feature = "test_emulator")]
+mod jade_emulator;
+
+#[cfg(feature = "test_emulator")]
+pub use jade_emulator::TestJadeEmulator;
+
 #[cfg(feature = "sync")]
 mod sync;
 
@@ -69,7 +75,7 @@ where
     match serde_cbor::from_reader::<protocol::Response<T>, &[u8]>(reader) {
         Ok(r) => {
             if let Some(result) = r.result {
-                tracing::debug!(
+                log::debug!(
                     "\n<---\t{:?}\n\t({} bytes) {}",
                     &result,
                     reader.len(),
@@ -86,8 +92,7 @@ where
         Err(e) => {
             let res = serde_cbor::from_reader::<serde_cbor::Value, &[u8]>(reader);
             if let Ok(value) = res {
-                // The value returned is a valid CBOR, but our structs doesn't map it correctly
-                dbg!(&value);
+                log::warn!("The value returned is a valid CBOR, but our structs doesn't map it correctly: {:?}", value);
                 return Some(Err(Error::SerdeCbor(e)));
             }
         }

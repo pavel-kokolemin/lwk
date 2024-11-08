@@ -2,17 +2,19 @@ use core::fmt::Debug;
 use std::str::FromStr;
 
 use elements_miniscript::elements::bitcoin::{
+    self,
     bip32::{DerivationPath, Fingerprint, Xpub},
     consensus::encode::deserialize_partial,
     secp256k1::ecdsa,
+    VarInt,
 };
 use elements_miniscript::elements::{
-    pset::PartiallySignedTransaction as Psbt, Address, AddressParams, VarInt,
+    pset::PartiallySignedTransaction as Psbt, Address, AddressParams,
 };
 use elements_miniscript::slip77::MasterBlindingKey;
 
 use crate::{
-    apdu::{APDUCommand, StatusWord},
+    apdu::{APDUCmdVec, StatusWord},
     command,
     error::LiquidClientError,
     interpreter::{get_merkleized_map_commitment, ClientCommandInterpreter},
@@ -33,7 +35,7 @@ impl<T: Transport> LiquidClient<T> {
 
     fn make_request(
         &self,
-        req: &APDUCommand,
+        req: &APDUCmdVec,
         interpreter: Option<&mut ClientCommandInterpreter>,
     ) -> Result<Vec<u8>, LiquidClientError<T::Error>> {
         let (mut sw, mut data) = self
@@ -218,7 +220,7 @@ impl<T: Transport> LiquidClient<T> {
         psbt: &Psbt,
         wallet: &WalletPolicy,
         wallet_hmac: Option<&[u8; 32]>,
-    ) -> Result<Vec<(usize, PartialSignature)>, LiquidClientError<T::Error>> {
+    ) -> Result<Vec<(usize, bitcoin::ecdsa::Signature)>, LiquidClientError<T::Error>> {
         let mut intpr = ClientCommandInterpreter::new();
         intpr.add_known_preimage(wallet.serialize());
         let keys: Vec<String> = wallet.keys.iter().map(|k| k.to_string()).collect();
@@ -300,7 +302,9 @@ impl<T: Transport> LiquidClient<T> {
 
             signatures.push((
                 input_index.0 as usize,
-                PartialSignature::from_slice(&result[i..]).map_err(|_| {
+                // TODO: consider updating with latest Ledger Bitcoin App version
+                // PartialSignature::from_slice(&result[i..]).map_err(|_| {
+                bitcoin::ecdsa::Signature::from_slice(&result[i..]).map_err(|_| {
                     LiquidClientError::UnexpectedResult {
                         command: cmd.ins,
                         data: result.clone(),
@@ -359,5 +363,5 @@ impl<T: Transport> LiquidClient<T> {
 /// Communication layer between the bitcoin client and the Ledger device.
 pub trait Transport {
     type Error: Debug;
-    fn exchange(&self, command: &APDUCommand) -> Result<(StatusWord, Vec<u8>), Self::Error>;
+    fn exchange(&self, command: &APDUCmdVec) -> Result<(StatusWord, Vec<u8>), Self::Error>;
 }

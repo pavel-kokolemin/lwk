@@ -11,3 +11,5 @@ qemu_efuse.bin
 context/jade-emulator/Dockerfile
 .direnv
 result
+*__pycache__
+venv/

@@ -5,6 +5,9 @@ components = [
   "clippy",
   "rust-src",
   "rust-std",
+  "rust-analyzer",
   "rustc",
   "rustfmt"
 ]
+targets = [ "wasm32-unknown-unknown" ]
+

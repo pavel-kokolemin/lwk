@@ -1,20 +1,25 @@
 use crate::bitcoin::bip32::Fingerprint;
+use crate::clients::LastUnused;
 use crate::config::{Config, ElementsNetwork};
 use crate::descriptor::Chain;
+use crate::elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
 use crate::elements::pset::PartiallySignedTransaction;
 use crate::elements::secp256k1_zkp::ZERO_TWEAK;
-use crate::elements::{AssetId, BlockHash, OutPoint, Script, Transaction, Txid};
+use crate::elements::{AssetId, BlockHash, OutPoint, Script, Transaction, TxOutSecrets, Txid};
 use crate::error::Error;
 use crate::hashes::Hash;
-use crate::model::{AddressResult, IssuanceDetails, WalletTx, WalletTxOut};
+use crate::model::{
+    AddressResult, BitcoinAddressResult, ExternalUtxo, IssuanceDetails, WalletTx, WalletTxOut,
+};
 use crate::persister::PersistError;
-use crate::store::{Height, Store, Timestamp};
+use crate::store::{Height, ScriptBatch, Store, Timestamp, BATCH_SIZE};
 use crate::tx_builder::{extract_issuances, WolletTxBuilder};
 use crate::util::EC;
 use crate::{FsPersister, NoPersist, Persister, Update, WolletDescriptor};
+use elements::bitcoin;
 use elements::bitcoin::bip32::ChildNumber;
 use elements_miniscript::psbt::PsbtExt;
-use elements_miniscript::{psbt, ForEachKey};
+use elements_miniscript::{psbt, BtcDescriptor, ForEachKey};
 use elements_miniscript::{
     ConfidentialDescriptor, DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
 };
@@ -32,11 +37,180 @@ pub struct Wollet {
     pub(crate) store: Store,
     pub(crate) persister: Arc<dyn Persister + Send + Sync>,
     descriptor: WolletDescriptor,
+    // cached value
+    max_weight_to_satisfy: usize,
+}
+
+/// A coincise state of the wallet, in particular having only transactions ids instead of full
+/// transactions and missing other things not strictly needed for a scan.
+/// By using this instead of a borrow of the wallet we can release locks
+pub struct WolletConciseState {
+    wollet_status: u64,
+    descriptor: WolletDescriptor,
+    txs: HashSet<Txid>,
+    paths: HashMap<Script, (Chain, ChildNumber)>,
+    scripts: HashMap<(Chain, ChildNumber), Script>,
+    heights: HashMap<Txid, Option<Height>>,
+    tip: (Height, BlockHash),
+    last_unused: LastUnused,
+}
+
+pub trait WolletState {
+    fn get_script_batch(
+        &self,
+        batch: u32,
+        descriptor: &Descriptor<DescriptorPublicKey>,
+    ) -> Result<ScriptBatch, Error>;
+    fn get_or_derive(
+        &self,
+        ext_int: Chain,
+        child: ChildNumber,
+        descriptor: &Descriptor<DescriptorPublicKey>,
+    ) -> Result<(Script, bool), Error>;
+    fn heights(&self) -> &HashMap<Txid, Option<Height>>;
+    fn paths(&self) -> &HashMap<Script, (Chain, ChildNumber)>;
+    fn txs(&self) -> HashSet<Txid>;
+    fn tip(&self) -> (Height, BlockHash);
+    fn last_unused(&self) -> LastUnused; // TODO change to &LastUnused when possible
+    fn descriptor(&self) -> WolletDescriptor;
+    fn wollet_status(&self) -> u64;
+}
+
+impl WolletState for WolletConciseState {
+    // TODO duplicated from Wollet
+    fn get_script_batch(
+        &self,
+        batch: u32,
+        descriptor: &Descriptor<DescriptorPublicKey>, // non confidential (we need only script_pubkey), non multipath (we need to be able to derive with index)
+    ) -> Result<ScriptBatch, Error> {
+        let mut result = ScriptBatch {
+            cached: true,
+            ..Default::default()
+        };
+
+        let start = batch * BATCH_SIZE;
+        let end = start + BATCH_SIZE;
+        let ext_int: Chain = descriptor.try_into().unwrap_or(Chain::External);
+        for j in start..end {
+            let child = ChildNumber::from_normal_idx(j)?;
+            let (script, cached) = self.get_or_derive(ext_int, child, descriptor)?;
+            result.cached = cached;
+            result.value.push((script, (ext_int, child)));
+        }
+
+        Ok(result)
+    }
+
+    fn get_or_derive(
+        &self,
+        ext_int: Chain,
+        child: ChildNumber,
+        descriptor: &Descriptor<DescriptorPublicKey>,
+    ) -> Result<(Script, bool), Error> {
+        let opt_script = self.scripts.get(&(ext_int, child));
+        let (script, cached) = match opt_script {
+            Some(script) => (script.clone(), true),
+            None => (
+                descriptor
+                    .at_derivation_index(child.into())?
+                    .script_pubkey(),
+                false,
+            ),
+        };
+        Ok((script, cached))
+    }
+
+    fn heights(&self) -> &HashMap<Txid, Option<Height>> {
+        &self.heights
+    }
+
+    fn paths(&self) -> &HashMap<Script, (Chain, ChildNumber)> {
+        &self.paths
+    }
+
+    fn txs(&self) -> HashSet<Txid> {
+        self.txs.clone()
+    }
+
+    fn tip(&self) -> (Height, BlockHash) {
+        self.tip
+    }
+
+    fn last_unused(&self) -> LastUnused {
+        self.last_unused.clone()
+    }
+
+    fn descriptor(&self) -> WolletDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn wollet_status(&self) -> u64 {
+        self.wollet_status
+    }
 }
 
 impl std::fmt::Debug for Wollet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "wollet({:?})", self.descriptor)
+    }
+}
+
+impl WolletState for Wollet {
+    fn get_script_batch(
+        &self,
+        batch: u32,
+        descriptor: &Descriptor<DescriptorPublicKey>,
+    ) -> Result<ScriptBatch, Error> {
+        self.store.get_script_batch(batch, descriptor)
+    }
+
+    fn get_or_derive(
+        &self,
+        ext_int: Chain,
+        child: ChildNumber,
+        descriptor: &Descriptor<DescriptorPublicKey>,
+    ) -> Result<(Script, bool), Error> {
+        self.store.get_or_derive(ext_int, child, descriptor)
+    }
+
+    fn heights(&self) -> &HashMap<Txid, Option<Height>> {
+        &self.store.cache.heights
+    }
+
+    fn paths(&self) -> &HashMap<Script, (Chain, ChildNumber)> {
+        &self.store.cache.paths
+    }
+
+    fn txs(&self) -> HashSet<Txid> {
+        self.store.cache.all_txs.keys().cloned().collect()
+    }
+
+    fn tip(&self) -> (Height, BlockHash) {
+        self.store.cache.tip
+    }
+
+    fn last_unused(&self) -> LastUnused {
+        // TODO use LastUnused internally in Wollet
+        LastUnused {
+            internal: self
+                .store
+                .cache
+                .last_unused_internal
+                .load(atomic::Ordering::Relaxed),
+            external: self
+                .store
+                .cache
+                .last_unused_external
+                .load(atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn descriptor(&self) -> WolletDescriptor {
+        self.wollet_descriptor()
+    }
+
+    fn wollet_status(&self) -> u64 {
+        self.status()
     }
 }
 
@@ -58,11 +232,15 @@ impl Wollet {
         let config = Config::new(network)?;
 
         let store = Store::default();
+        let max_weight_to_satisfy = descriptor
+            .definite_descriptor(Chain::External, 0)?
+            .max_weight_to_satisfy()?;
         let mut wollet = Wollet {
             store,
             config,
             descriptor,
             persister,
+            max_weight_to_satisfy,
         };
 
         for i in 0.. {
@@ -73,6 +251,28 @@ impl Wollet {
         }
 
         Ok(wollet)
+    }
+
+    /// Max weight to satisfy for inputs belonging to this wallet
+    pub fn max_weight_to_satisfy(&self) -> usize {
+        self.max_weight_to_satisfy
+    }
+
+    pub fn state(&self) -> WolletConciseState {
+        let cache = &self.store.cache;
+        WolletConciseState {
+            wollet_status: self.status(),
+            descriptor: self.wollet_descriptor(),
+            txs: cache.all_txs.keys().cloned().collect(),
+            paths: cache.paths.clone(),
+            scripts: cache.scripts.clone(),
+            heights: cache.heights.clone(),
+            tip: cache.tip,
+            last_unused: LastUnused {
+                internal: cache.last_unused_internal.load(atomic::Ordering::Relaxed),
+                external: cache.last_unused_external.load(atomic::Ordering::Relaxed),
+            },
+        }
     }
 
     /// Create a new wallet persisting on file system
@@ -137,19 +337,48 @@ impl Wollet {
     /// If Some return the address at the given index,
     /// otherwise the last unused address.
     pub fn address(&self, index: Option<u32>) -> Result<AddressResult, Error> {
-        let index = match index {
+        let index = self.unwrap_or_last_unused(index);
+
+        let address = self
+            .descriptor
+            .address(index, self.config.address_params())?;
+        Ok(AddressResult::new(address, index))
+    }
+
+    /// Get a wallet pegin address
+    ///
+    /// A pegin address is a bitcoin address, funds sent to this address are
+    /// converted to liquid bitcoins.
+    ///
+    /// If Some return the address at the given index,
+    /// otherwise the last unused address.
+    pub fn pegin_address(
+        &self,
+        index: Option<u32>,
+        fed_desc: BtcDescriptor<bitcoin::PublicKey>,
+    ) -> Result<BitcoinAddressResult, Error> {
+        let index = self.unwrap_or_last_unused(index);
+        let network = match self.network() {
+            ElementsNetwork::Liquid => bitcoin::Network::Bitcoin,
+            ElementsNetwork::LiquidTestnet => bitcoin::Network::Testnet,
+            ElementsNetwork::ElementsRegtest { policy_asset: _ } => bitcoin::Network::Regtest,
+        };
+
+        let address = self.descriptor.pegin_address(index, network, fed_desc)?;
+        Ok(BitcoinAddressResult::new(address, index))
+    }
+
+    /// Returns the given `index` unwrapped if Some, otherwise
+    /// takes the last unused external index of the wallet
+    fn unwrap_or_last_unused(&self, index: Option<u32>) -> u32 {
+        match index {
             Some(i) => i,
             None => self
                 .store
                 .cache
                 .last_unused_external
                 .load(atomic::Ordering::Relaxed),
-        };
-
-        let address = self
-            .descriptor
-            .address(index, self.config.address_params())?;
-        Ok(AddressResult::new(address, index))
+        }
     }
 
     /// Get a wallet change address
@@ -238,6 +467,39 @@ impl Wollet {
             .collect())
     }
 
+    /// Get the explicit UTXOs sent to script pubkeys owned by the wallet
+    ///
+    /// They can be spent as external utxos.
+    pub fn explicit_utxos(&self) -> Result<Vec<ExternalUtxo>, Error> {
+        let spent = self.store.spent()?;
+        let mut utxos = vec![];
+        for (txid, tx) in self.store.cache.all_txs.iter() {
+            for (vout, o) in tx.output.iter().enumerate() {
+                let outpoint = OutPoint::new(*txid, vout as u32);
+                if !o.script_pubkey.is_empty()
+                    && o.asset.is_explicit()
+                    && o.value.is_explicit()
+                    && self.store.cache.paths.contains_key(&o.script_pubkey)
+                    && !spent.contains(&outpoint)
+                {
+                    let unblinded = TxOutSecrets::new(
+                        o.asset.explicit().expect("explicit"),
+                        AssetBlindingFactor::zero(),
+                        o.value.explicit().expect("explicit"),
+                        ValueBlindingFactor::zero(),
+                    );
+                    utxos.push(ExternalUtxo {
+                        outpoint,
+                        txout: o.clone(),
+                        unblinded,
+                        max_weight_to_satisfy: self.max_weight_to_satisfy,
+                    });
+                }
+            }
+        }
+        Ok(utxos)
+    }
+
     pub(crate) fn balance_from_utxos(
         &self,
         utxos: &[WalletTxOut],
@@ -256,7 +518,7 @@ impl Wollet {
         self.balance_from_utxos(&utxos)
     }
 
-    /// Get the wallet transactions with their heights (if confirmed)
+    /// Get the wallet transactions
     pub fn transactions(&self) -> Result<Vec<WalletTx>, Error> {
         let mut txs = vec![];
         let mut my_txids: Vec<(&Txid, &Option<u32>)> = self.store.cache.heights.iter().collect();
@@ -280,6 +542,11 @@ impl Wollet {
                 .ok_or_else(|| Error::Generic(format!("list_tx no tx {}", txid)))?;
 
             let balance = tx_balance(**txid, tx, &txos);
+            if balance.is_empty() {
+                // Transaction has no output or input that the wollet can unblind,
+                // ignore this transaction
+                continue;
+            }
             let fee = tx_fee(tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(tx, &policy_asset, &balance, fee);
@@ -414,10 +681,18 @@ impl Wollet {
 
         // Set PSET xpub origin
         self.descriptor().descriptor.for_each_key(|k| {
-            if let DescriptorPublicKey::XPub(x) = k {
-                if let Some(origin) = &x.origin {
-                    pset.global.xpub.insert(x.xkey, origin.clone());
+            match k {
+                DescriptorPublicKey::XPub(x) => {
+                    if let Some(origin) = &x.origin {
+                        pset.global.xpub.insert(x.xkey, origin.clone());
+                    }
                 }
+                DescriptorPublicKey::MultiXPub(x) => {
+                    if let Some(origin) = &x.origin {
+                        pset.global.xpub.insert(x.xkey, origin.clone());
+                    }
+                }
+                _ => {}
             }
             true
         });
@@ -799,8 +1074,18 @@ mod tests {
 
         let mut hasher = FxHasher::default();
         wollet.hash(&mut hasher);
-        assert_eq!(16997737043419915973, hasher.finish());
+        assert_eq!(4667218140179748739, hasher.finish());
 
-        assert_eq!(16997737043419915973, wollet.status());
+        assert_eq!(4667218140179748739, wollet.status());
+    }
+
+    #[test]
+    fn test_wollet_pegin_address() {
+        let fed_desc: BtcDescriptor<bitcoin::PublicKey> =
+            BtcDescriptor::<bitcoin::PublicKey>::from_str(lwk_test_util::FED_PEG_DESC).unwrap();
+        let wollet = new_wollet(lwk_test_util::PEGIN_TEST_DESC);
+        let addr = wollet.pegin_address(Some(0), fed_desc).unwrap();
+        assert_eq!(addr.tweak_index(), 0);
+        assert_eq!(addr.address().to_string(), lwk_test_util::PEGIN_TEST_ADDR);
     }
 }

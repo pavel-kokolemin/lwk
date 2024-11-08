@@ -19,11 +19,16 @@ impl ElectrumClient {
         tls: bool,
         validate_domain: bool,
     ) -> Result<Arc<Self>, LwkError> {
-        let url = lwk_wollet::ElectrumUrl::new(electrum_url, tls, validate_domain);
+        let url = lwk_wollet::ElectrumUrl::new(electrum_url, tls, validate_domain)
+            .map_err(lwk_wollet::Error::Url)?;
         let client = lwk_wollet::ElectrumClient::new(&url)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(client),
         }))
+    }
+
+    pub fn ping(&self) -> Result<(), LwkError> {
+        Ok(self.inner.lock()?.ping()?)
     }
 
     pub fn broadcast(&self, tx: &Transaction) -> Result<Arc<Txid>, LwkError> {
@@ -32,7 +37,7 @@ impl ElectrumClient {
 
     pub fn full_scan(&self, wollet: &Wollet) -> Result<Option<Arc<Update>>, LwkError> {
         let wollet = wollet.inner_wollet()?;
-        let update: Option<lwk_wollet::Update> = self.inner.lock()?.full_scan(&wollet)?;
+        let update: Option<lwk_wollet::Update> = self.inner.lock()?.full_scan(&wollet.state())?;
         Ok(update.map(Into::into).map(Arc::new))
     }
 }

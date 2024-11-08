@@ -49,12 +49,24 @@ pub enum NewError {
     Bip32(#[from] bip32::Error),
 }
 
+/// Options for ECDSA signing
+#[derive(Clone, Debug, Default)]
+enum EcdsaSignOpt {
+    /// Create signature with low r
+    #[default]
+    LowR,
+
+    /// Create signatures without grinding the nonce
+    NoGrind,
+}
+
 /// A software signer
 #[derive(Clone)]
 pub struct SwSigner {
     pub(crate) xprv: Xpriv,
     pub(crate) secp: Secp256k1<All>, // could be sign only, but it is likely the caller already has the All context.
     pub(crate) mnemonic: Option<Mnemonic>,
+    ecdsa_sign_opt: EcdsaSignOpt,
 }
 
 impl core::fmt::Debug for SwSigner {
@@ -85,6 +97,7 @@ impl SwSigner {
             xprv,
             secp,
             mnemonic: Some(mnemonic),
+            ecdsa_sign_opt: EcdsaSignOpt::default(),
         })
     }
 
@@ -98,7 +111,18 @@ impl SwSigner {
             xprv,
             secp: Secp256k1::new(),
             mnemonic: None,
+            ecdsa_sign_opt: EcdsaSignOpt::default(),
         }
+    }
+
+    /// Produce "low R" ECDSA signatures (default and recommended option)
+    pub fn set_ecdsa_sign_low_r(&mut self) {
+        self.ecdsa_sign_opt = EcdsaSignOpt::LowR;
+    }
+
+    /// Produce no grind "R" in ECDSA signatures
+    pub fn set_ecdsa_sign_no_grind(&mut self) {
+        self.ecdsa_sign_opt = EcdsaSignOpt::NoGrind;
     }
 
     pub fn xpub(&self) -> Xpub {
@@ -115,6 +139,10 @@ impl SwSigner {
 
     pub fn fingerprint(&self) -> Fingerprint {
         self.xprv.fingerprint(&self.secp)
+    }
+
+    pub fn derive_xprv(&self, path: &DerivationPath) -> Result<Xpriv, SignError> {
+        Ok(self.xprv.derive_priv(&self.secp, path)?)
     }
 }
 
@@ -150,7 +178,12 @@ impl Signer for SwSigner {
                     let public_key = private_key.public_key(&self.secp);
                     if want_public_key == &public_key {
                         // fixme: for taproot use schnorr
-                        let sig = self.secp.sign_ecdsa_low_r(&msg, &private_key.inner);
+                        let sig = match self.ecdsa_sign_opt {
+                            EcdsaSignOpt::LowR => {
+                                self.secp.sign_ecdsa_low_r(&msg, &private_key.inner)
+                            }
+                            EcdsaSignOpt::NoGrind => self.secp.sign_ecdsa(&msg, &private_key.inner),
+                        };
                         let sig = elementssig_to_rawsig(&(sig, hash_ty));
 
                         let inserted = input.partial_sigs.insert(public_key, sig);
@@ -203,6 +236,12 @@ mod tests {
             slip77.as_bytes().to_hex(),
             lwk_test_util::TEST_MNEMONIC_SLIP77
         );
+
+        let path: DerivationPath = "m/0'".parse().unwrap();
+        let xprv = signer.derive_xprv(&path).unwrap();
+        let xpub = signer.derive_xpub(&path).unwrap();
+        let secp = Secp256k1::new();
+        assert_eq!(xpub, Xpub::from_priv(&secp, &xprv));
     }
 
     #[test]
@@ -214,5 +253,32 @@ mod tests {
         assert_eq!(signer.xpub(), xpub);
         assert!(signer.mnemonic().is_none());
         assert!(signer.seed().is_none());
+    }
+
+    #[test]
+    fn signer_ecdsa_opt() {
+        // Sign with the default option (low R) and then with the "no grind" option
+        let mut signer = SwSigner::new(lwk_test_util::TEST_MNEMONIC, false).unwrap();
+        let b64 = include_str!("../../lwk_jade/test_data/pset_to_be_signed.base64");
+        let mut pset_low_r: PartiallySignedTransaction = b64.parse().unwrap();
+        let sig_added = signer.sign(&mut pset_low_r).unwrap();
+        assert_eq!(sig_added, 1);
+
+        signer.set_ecdsa_sign_no_grind();
+        let mut pset_no_grind: PartiallySignedTransaction = b64.parse().unwrap();
+        let sig_added = signer.sign(&mut pset_no_grind).unwrap();
+        assert_eq!(sig_added, 1);
+
+        // In the case the signatures are different, but in general signatures might not
+        // differ, since the grinding for low R might not be necessary.
+        assert_ne!(pset_no_grind, pset_low_r);
+        let sig_no_grind = pset_no_grind.inputs()[0]
+            .partial_sigs
+            .values()
+            .next()
+            .unwrap();
+        let sig_low_r = pset_low_r.inputs()[0].partial_sigs.values().next().unwrap();
+        assert_ne!(sig_low_r, sig_no_grind);
+        assert!(sig_low_r.len() < sig_no_grind.len());
     }
 }

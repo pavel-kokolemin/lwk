@@ -11,7 +11,7 @@ use rand::thread_rng;
 
 use crate::{
     hashes::Hash,
-    model::{IssuanceDetails, Recipient},
+    model::{ExternalUtxo, IssuanceDetails, Recipient},
     pset_create::{validate_address, IssuanceRequest},
     Contract, ElementsNetwork, Error, UnvalidatedRecipient, Wollet, EC,
 };
@@ -50,6 +50,30 @@ pub fn extract_issuances(tx: &Transaction) -> Vec<IssuanceDetails> {
     r
 }
 
+/// "Clone" of Wollet.add_input
+fn add_external_input(
+    pset: &mut PartiallySignedTransaction,
+    inp_txout_sec: &mut HashMap<usize, elements::TxOutSecrets>,
+    inp_weight: &mut usize,
+    utxo: &ExternalUtxo,
+) {
+    let mut input = elements::pset::Input::from_prevout(utxo.outpoint);
+    let mut txout = utxo.txout.clone();
+    // This field is used by stateless blinders or signers to
+    // learn the blinding factors and unblinded values of this input.
+    // We need this since the output witness, which includes the
+    // rangeproof, is not serialized.
+    // Note that we explicitly remove the txout rangeproof to avoid
+    // relying on its presence.
+    input.in_utxo_rangeproof = txout.witness.rangeproof.take();
+    input.witness_utxo = Some(txout);
+
+    pset.add_input(input);
+    let idx = pset.inputs().len() - 1;
+    inp_txout_sec.insert(idx, utxo.unblinded);
+    *inp_weight += utxo.max_weight_to_satisfy;
+}
+
 /// A transaction builder
 ///
 /// See [`WolletTxBuilder`] for usage from rust.
@@ -65,10 +89,12 @@ pub struct TxBuilder {
     network: ElementsNetwork,
     recipients: Vec<Recipient>,
     fee_rate: f32,
+    ct_discount: bool,
     issuance_request: IssuanceRequest,
     blind: bool,
     drain_lbtc: bool,
     drain_to: Option<Address>,
+    external_utxos: Vec<ExternalUtxo>,
 }
 
 impl TxBuilder {
@@ -78,10 +104,12 @@ impl TxBuilder {
             network,
             recipients: vec![],
             fee_rate: 100.0,
+            ct_discount: false,
             issuance_request: IssuanceRequest::None,
             blind: true,
             drain_lbtc: false,
             drain_to: None,
+            external_utxos: vec![],
         }
     }
 
@@ -144,7 +172,8 @@ impl TxBuilder {
         self.add_unvalidated_recipient(&rec)
     }
 
-    /// Set custom fee rate
+    /// Fee rate in sats/kvb
+    /// Multiply sats/vb value by 1000 i.e. 1.0 sat/byte = 1000.0 sat/kvb
     pub fn fee_rate(mut self, fee_rate: Option<f32>) -> Self {
         if let Some(fee_rate) = fee_rate {
             self.fee_rate = fee_rate
@@ -154,6 +183,21 @@ impl TxBuilder {
 
     pub fn blind(mut self, blind: bool) -> Self {
         self.blind = blind;
+        self
+    }
+
+    /// Use ELIP200 discounted fees for Confidential Transactions
+    ///
+    /// Note: if ELIP200 was not activated by miners and nodes relaying transactions, using
+    /// this feature might cause the transaction to be rejected.
+    pub fn enable_ct_discount(mut self) -> Self {
+        self.ct_discount = true;
+        self
+    }
+
+    /// Do not use ELIP200 discounted fees for Confidential Transactions
+    pub fn disable_ct_discount(mut self) -> Self {
+        self.ct_discount = false;
         self
     }
 
@@ -247,6 +291,22 @@ impl TxBuilder {
         self
     }
 
+    /// Adds external UTXOs
+    ///
+    /// Note: unblinded UTXOs with the same scriptpubkeys as the wallet, are considered external.
+    pub fn add_external_utxos(mut self, utxos: Vec<ExternalUtxo>) -> Result<Self, Error> {
+        // TODO: allow for non L-BTC utxos
+        let policy_asset = self.network().policy_asset();
+        for utxo in &utxos {
+            if utxo.unblinded.asset != policy_asset {
+                return Err(Error::Generic("External utxos must be L-BTC".to_string()));
+            }
+        }
+
+        self.external_utxos.extend(utxos);
+        Ok(self)
+    }
+
     /// Finish building the transaction
     pub fn finish(self, wollet: &Wollet) -> Result<PartiallySignedTransaction, Error> {
         // Init PSET
@@ -300,6 +360,15 @@ impl TxBuilder {
         for addressee in addressees_lbtc {
             wollet.add_output(&mut pset, &addressee)?;
             satoshi_out += addressee.satoshi;
+        }
+
+        // Add all external L-BTC utxos
+        for utxo in &self.external_utxos {
+            if utxo.unblinded.asset != policy_asset {
+                continue;
+            }
+            add_external_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo);
+            satoshi_in += utxo.unblinded.value;
         }
 
         // FIXME: For implementation simplicity now we always add all L-BTC inputs
@@ -407,10 +476,10 @@ impl TxBuilder {
             }
         }
 
-        // Add a temporary fee, and always add a change output,
+        // Add a temporary fee, and always add a change or drain output,
         // then we'll tweak those values to match the given fee rate.
-        let temp_fee = 1000;
-        if satoshi_in < (satoshi_out + temp_fee) {
+        let temp_fee = 1;
+        if satoshi_in <= (satoshi_out + temp_fee) {
             return Err(Error::InsufficientFunds);
         }
         let satoshi_change = satoshi_in - satoshi_out - temp_fee;
@@ -432,12 +501,20 @@ impl TxBuilder {
             let mut rng = thread_rng();
             let mut temp_pset = pset.clone();
             temp_pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
-            inp_weight + temp_pset.extract_tx()?.weight()
+            let tx_weight = {
+                let tx = temp_pset.extract_tx()?;
+                if self.ct_discount {
+                    tx.discount_weight()
+                } else {
+                    tx.weight()
+                }
+            };
+            inp_weight + tx_weight
         };
 
         let vsize = (weight + 4 - 1) / 4;
         let fee = (vsize as f32 * self.fee_rate / 1000.0).ceil() as u64;
-        if satoshi_in < (satoshi_out + temp_fee) {
+        if satoshi_in <= (satoshi_out + fee) {
             return Err(Error::InsufficientFunds);
         }
         let satoshi_change = satoshi_in - satoshi_out - fee;
@@ -552,6 +629,22 @@ impl<'a> WolletTxBuilder<'a> {
         }
     }
 
+    /// Wrapper of [`TxBuilder::enable_ct_discount()`]
+    pub fn enable_ct_discount(self) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.enable_ct_discount(),
+        }
+    }
+
+    /// Wrapper of [`TxBuilder::disable_ct_discount()`]
+    pub fn disable_ct_discount(self) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.disable_ct_discount(),
+        }
+    }
+
     /// Wrapper of [`TxBuilder::issue_asset()`]
     pub fn issue_asset(
         self,
@@ -613,5 +706,13 @@ impl<'a> WolletTxBuilder<'a> {
             wollet: self.wollet,
             inner: self.inner.drain_lbtc_to(address),
         }
+    }
+
+    /// Wrapper of [`TxBuilder::add_external_utxos()`]
+    pub fn add_external_utxos(self, utxos: Vec<ExternalUtxo>) -> Result<Self, Error> {
+        Ok(Self {
+            wollet: self.wollet,
+            inner: self.inner.add_external_utxos(utxos)?,
+        })
     }
 }

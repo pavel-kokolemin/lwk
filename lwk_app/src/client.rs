@@ -37,9 +37,9 @@ impl Client {
         let params = req.map(|req| to_raw_value(&req)).transpose()?;
         let method = method.to_string();
         let request = self.client.build_request(&method, params.as_deref());
-        tracing::trace!("---> {}", serde_json::to_string(&request)?);
+        log::trace!("---> {}", serde_json::to_string(&request)?);
         let response = self.client.send_request(request)?;
-        tracing::trace!("<--- {}", serde_json::to_string(&response)?);
+        log::trace!("<--- {}", serde_json::to_string(&response)?);
         match response.result.as_ref() {
             Some(result) => Ok(serde_json::from_str(result.get())?),
             None => match response.error {
@@ -145,11 +145,13 @@ impl Client {
         name: String,
         addressees: Vec<UnvalidatedRecipient>,
         fee_rate: Option<f32>,
+        enable_ct_discount: bool,
     ) -> Result<response::Pset, Error> {
         let req = request::WalletSendMany {
             addressees: addressees.into_iter().map(unvalidate_addressee).collect(),
             fee_rate,
             name,
+            enable_ct_discount,
         };
         self.make_request(Method::WalletSendMany, Some(req))
     }

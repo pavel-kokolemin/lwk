@@ -18,7 +18,7 @@ use lwk_cli::{
     inner_main, AssetSubCommandsEnum, Cli, ServerSubCommandsEnum, SignerSubCommandsEnum,
     WalletSubCommandsEnum,
 };
-use lwk_test_util::{setup, TestElectrumServer};
+use lwk_test_util::TestElectrumServer;
 use tempfile::TempDir;
 
 /// Returns a non-used local port if available.
@@ -47,7 +47,6 @@ fn sh_result(command: &str) -> anyhow::Result<Value> {
 
 #[track_caller]
 pub fn sh(command: &str) -> Value {
-    dbg!(command);
     sh_result(command).unwrap()
 }
 
@@ -76,7 +75,7 @@ fn setup_cli(
     TestElectrumServer,
     Option<RegistryProc>,
 ) {
-    let server = setup(true);
+    let server = lwk_test_util::setup_with_esplora();
     let tmp = tempfile::tempdir().unwrap();
     let datadir = tmp.path().display().to_string();
 
@@ -249,9 +248,11 @@ fn asset_ids_from_issuance_pset(cli: &str, wallet: &str, pset: &str) -> (String,
 fn fund(server: &TestElectrumServer, cli: &str, wallet: &str, sats: u64) {
     let addr = Address::from_str(&address(cli, wallet)).unwrap();
 
-    let txid = server.node_sendtoaddress(&addr, sats, None).to_string();
+    let txid = server
+        .elementsd_sendtoaddress(&addr, sats, None)
+        .to_string();
     // Only 2 blocks are necessary to make coinbase spendable
-    server.generate(2);
+    server.elementsd_generate(2);
     wait_tx(cli, wallet, &txid);
 }
 
@@ -298,7 +299,7 @@ fn send(
 
 #[test]
 fn test_state_regression() {
-    let server = setup(false);
+    let server = lwk_test_util::setup();
     let electrum_url = &server.electrs.electrum_url;
     let addr = get_available_addr().unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -553,6 +554,12 @@ fn test_wallet_load_unload_list() {
     let r = sh(&format!("{cli} wallet list"));
     assert_eq!(get_len(&r, "wallets"), 0);
 
+    let desc_mainnet = "ct(1111111111111111111111111111111111111111111111111111111111111111,elwpkh(xpub661MyMwAqRbcH4oCG7tpubMCYWM3pHRZbhBQgi7uVZGcu1EuuomWqwB5gGHXk4VykarKGVA2jKtT4esCXspWW45mzwAzZEsi3U5j94gCKXc/*))";
+    let err = sh_err(&format!(
+        "{cli} wallet load --wallet main -d {desc_mainnet}"
+    ));
+    assert!(err.contains("Descriptor is for the wrong network"));
+
     sh(&format!("{cli} server stop"));
     t.join().unwrap();
 }
@@ -765,7 +772,7 @@ fn test_broadcast() {
 
     let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
     assert_eq!(1_000_000, get_balance(&cli, "w1", policy_asset));
-    let addr = server.node_getnewaddress().to_string();
+    let addr = server.elementsd_getnewaddress().to_string();
     send(&cli, "w1", &addr, policy_asset, 1000, &["s1"]);
     assert!(1_000_000 > get_balance(&cli, "w1", policy_asset));
 
@@ -864,7 +871,7 @@ fn test_issue() {
     assert_eq!(get_len(&r, "assets"), 2);
 
     let asset_balance_pre = get_balance(&cli, "w1", asset);
-    let node_address = server.node_getnewaddress();
+    let node_address = server.elementsd_getnewaddress();
     let recipient = format!("--recipient {node_address}:1:{asset}");
     let r = sh(&format!("{cli} wallet send --wallet w1 {recipient}"));
     // TODO: add PSET introspection verifying there are asset metadata
@@ -912,7 +919,7 @@ fn test_issue() {
         assert!(url.contains(policy_asset));
     }
 
-    server.generate(1);
+    server.elementsd_generate(1);
     sh(&format!("{cli} server scan"));
 
     let r = sh(&format!("{cli} wallet txs --wallet w1 --with-tickers"));
@@ -1123,7 +1130,7 @@ fn test_multisig() {
 
     fund(&server, &cli, "multi", 1_000_000);
 
-    let node_address = server.node_getnewaddress();
+    let node_address = server.elementsd_getnewaddress();
     let satoshi = 1000;
     let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
     let recipient = format!("{node_address}:{satoshi}:{policy_asset}");
@@ -1304,7 +1311,7 @@ fn test_registry_publish() {
         "{cli} wallet broadcast --wallet w1 --pset {pset_signed}"
     ));
 
-    server.generate(2);
+    server.elementsd_generate(2);
     wait_ms(6_000); // otherwise registry may find the issuance tx unconfirmed, wait_tx is not enough
 
     sh(&format!("{cli} server scan"));
@@ -1450,13 +1457,51 @@ fn test_send_all() {
 
     fund(&server, &cli, "w1", 1_000_000);
 
-    let node_address = server.node_getnewaddress();
+    let node_address = server.elementsd_getnewaddress();
     let r = sh(&format!(
         "{cli} wallet drain -w w1 --address {node_address}"
     ));
     complete(&cli, "w1", get_str(&r, "pset"), signers);
     let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
     assert_eq!(get_balance(&cli, "w1", policy_asset), 0);
+
+    sh(&format!("{cli} server stop"));
+    t.join().unwrap();
+}
+
+#[test]
+fn test_ct_discount() {
+    let (t, _tmp, cli, _params, server, _) = setup_cli(false);
+
+    sw_signer(&cli, "sw");
+    singlesig_wallet(&cli, "w1", "sw", "slip77", "wpkh");
+    let signers = &["sw"];
+
+    fund(&server, &cli, "w1", 1_000_000);
+
+    let address = server.elementsd_getnewaddress();
+    let sats = 1_000;
+    let policy_asset = "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225";
+    let recipient = format!(" --recipient {address}:{sats}:{policy_asset}");
+
+    // Without CT discount
+    let r = sh(&format!("{cli} wallet send -w w1 {recipient}"));
+    let pset = get_str(&r, "pset");
+    complete(&cli, "w1", pset, signers);
+    let r = sh(&format!("{cli} wallet pset-details --wallet w1 -p {pset}"));
+    let fee_no_ct_discount = r.get("fee").unwrap().as_u64().unwrap();
+
+    // With CT discount
+    let r = sh(&format!(
+        "{cli} wallet send -w w1 {recipient} --enable-ct-discount"
+    ));
+    let pset = get_str(&r, "pset");
+    complete(&cli, "w1", pset, signers);
+    let r = sh(&format!("{cli} wallet pset-details --wallet w1 -p {pset}"));
+    let fee_ct_discount = r.get("fee").unwrap().as_u64().unwrap();
+
+    assert_eq!(fee_no_ct_discount, 250);
+    assert_eq!(fee_ct_discount, 35);
 
     sh(&format!("{cli} server stop"));
     t.join().unwrap();

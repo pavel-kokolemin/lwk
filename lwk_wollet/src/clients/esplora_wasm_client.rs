@@ -3,18 +3,19 @@
 
 use super::{try_unblind, History};
 use crate::{
+    clients::waterfalls::{encrypt, WaterfallsResult},
+    clients::Data,
     store::{Height, Store, Timestamp, BATCH_SIZE},
     update::DownloadTxResult,
-    Chain, Error, Update, Wollet, WolletDescriptor,
+    Chain, ElementsNetwork, Error, Update, Wollet, WolletDescriptor,
 };
-use elements::{bitcoin::bip32::ChildNumber, OutPoint};
+use age::x25519::Recipient;
+use elements::{bitcoin::bip32::ChildNumber, Address, OutPoint};
 use elements::{
-    encode::Decodable,
-    hashes::{hex::FromHex, sha256, Hash},
-    hex::ToHex,
-    pset::serialize::Serialize,
-    BlockHash, Script, Txid,
+    encode::Decodable, hashes::hex::FromHex, hex::ToHex, pset::serialize::Serialize, BlockHash,
+    Script, Txid,
 };
+use elements_miniscript::DescriptorPublicKey;
 use reqwest::Response;
 use serde::Deserialize;
 use std::{
@@ -27,22 +28,43 @@ use std::{
 /// A blockchain backend implementation based on the
 /// [esplora HTTP API](https://github.com/blockstream/esplora/blob/master/API.md)
 pub struct EsploraWasmClient {
+    client: reqwest::Client,
     base_url: String,
     tip_hash_url: String,
     broadcast_url: String,
+    waterfalls: bool,
+    waterfalls_server_recipient: Option<Recipient>,
+
+    /// Avoid encrypting the descriptor field
+    waterfalls_avoid_encryption: bool,
+
+    network: ElementsNetwork,
 }
 
 impl EsploraWasmClient {
-    pub fn new(url: &str) -> Self {
+    /// Creates a new esplora client using the given `url` as endpoint.
+    ///
+    /// If `waterfalls` is true, it expects the server support the descriptor endpoint, which avoids several roundtrips
+    /// during the scan and for this reason is much faster. To achieve so the "bitcoin descriptor" part is shared with
+    /// the server. All of the address are shared with the server anyway even without the waterfalls scan, but in
+    /// separate calls, and in this case future addresses cannot be derived.
+    /// In both cases, the server can see transactions that are involved in the wallet but it knows nothing about the
+    /// assets and amount exchanged due to the nature of confidential transactions.
+    pub fn new(network: ElementsNetwork, url: &str, waterfalls: bool) -> Self {
         Self {
+            client: reqwest::Client::new(),
             base_url: url.to_string(),
             tip_hash_url: format!("{url}/blocks/tip/hash"),
             broadcast_url: format!("{url}/tx"),
+            waterfalls,
+            waterfalls_server_recipient: None,
+            waterfalls_avoid_encryption: false,
+            network,
         }
     }
 
     async fn last_block_hash(&mut self) -> Result<elements::BlockHash, crate::Error> {
-        let response = get_with_retry(&self.tip_hash_url).await?;
+        let response = get_with_retry(&self.client, &self.tip_hash_url).await?;
         Ok(BlockHash::from_str(&response.text().await?)?)
     }
 
@@ -50,7 +72,7 @@ impl EsploraWasmClient {
         let last_block_hash = self.last_block_hash().await?;
 
         let header_url = format!("{}/block/{}/header", self.base_url, last_block_hash);
-        let response = get_with_retry(&header_url).await?;
+        let response = get_with_retry(&self.client, &header_url).await?;
         let header_bytes = Vec::<u8>::from_hex(&response.text().await?)?;
 
         let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
@@ -62,21 +84,22 @@ impl EsploraWasmClient {
         tx: &elements::Transaction,
     ) -> Result<elements::Txid, crate::Error> {
         let tx_hex = tx.serialize().to_hex();
-        let client = reqwest::Client::new();
-        let response = client.post(&self.broadcast_url).body(tx_hex).send().await?;
+        let response = self
+            .client
+            .post(&self.broadcast_url)
+            .body(tx_hex)
+            .send()
+            .await?;
         let txid = elements::Txid::from_str(&response.text().await?)?;
         Ok(txid)
     }
 
-    async fn get_transactions(&self, txids: &[Txid]) -> Result<Vec<elements::Transaction>, Error> {
-        let mut result = vec![];
-        for txid in txids.iter() {
-            let tx_url = format!("{}/tx/{}/raw", self.base_url, txid);
-            let response = get_with_retry(&tx_url).await?;
-            let tx = elements::Transaction::consensus_decode(&response.bytes().await?[..])?;
-            result.push(tx);
-        }
-        Ok(result)
+    async fn get_transaction(&self, txid: Txid) -> Result<elements::Transaction, Error> {
+        let tx_url = format!("{}/tx/{}/raw", self.base_url, txid);
+        let response = get_with_retry(&self.client, &tx_url).await?;
+        let tx = elements::Transaction::consensus_decode(&response.bytes().await?[..])?;
+
+        Ok(tx)
     }
 
     async fn get_headers(
@@ -90,13 +113,13 @@ impl EsploraWasmClient {
                 Some(block_hash) => *block_hash,
                 None => {
                     let block_height = format!("{}/block-height/{}", self.base_url, height);
-                    let response = get_with_retry(&block_height).await?;
+                    let response = get_with_retry(&self.client, &block_height).await?;
                     BlockHash::from_str(&response.text().await?)?
                 }
             };
 
             let block_header = format!("{}/block/{}/header", self.base_url, block_hash);
-            let response = get_with_retry(&block_header).await?;
+            let response = get_with_retry(&self.client, &block_header).await?;
             let header_bytes = Vec::<u8>::from_hex(&response.text().await?)?;
 
             let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
@@ -112,12 +135,22 @@ impl EsploraWasmClient {
     async fn get_scripts_history(&self, scripts: &[&Script]) -> Result<Vec<Vec<History>>, Error> {
         let mut result: Vec<_> = vec![];
         for script in scripts.iter() {
-            let script = elements::bitcoin::Script::from_bytes(script.as_bytes());
-            let script_hash = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-            let url = format!("{}/scripthash/{}/txs", self.base_url, script_hash.to_hex());
+            let address = Address::from_script(script, None, self.network.address_params()).ok_or(
+                Error::Generic("script generated is not a known template".to_owned()),
+            )?;
+            let url = format!("{}/address/{}/txs", self.base_url, address);
             // TODO must handle paging -> https://github.com/blockstream/esplora/blob/master/API.md#addresses
-            let response = get_with_retry(&url).await?;
-            let json: Vec<EsploraTx> = serde_json::from_str(&response.text().await?)?;
+            let response = get_with_retry(&self.client, &url).await?;
+
+            // TODO going through string and then json is not as efficient as it could be but we prioritize debugging for now
+            let text = response.text().await?;
+            let json: Vec<EsploraTx> = match serde_json::from_str(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("error {e:?} in converting following text:\n{text}");
+                    return Err(e.into());
+                }
+            };
 
             let history: Vec<History> = json.into_iter().map(Into::into).collect();
             result.push(history)
@@ -128,13 +161,104 @@ impl EsploraWasmClient {
     pub async fn full_scan(&mut self, wollet: &Wollet) -> Result<Option<Update>, Error> {
         let descriptor = wollet.wollet_descriptor();
         let store = &wollet.store;
-        let mut txid_height = HashMap::new();
-        let mut scripts = HashMap::new();
 
-        let mut last_unused_external = 0;
-        let mut last_unused_internal = 0;
-        let mut height_blockhash = HashMap::new();
+        let Data {
+            txid_height,
+            scripts,
+            last_unused,
+            height_blockhash,
+            height_timestamp,
+        } = if self.waterfalls {
+            match self.get_history_waterfalls(&descriptor, store).await {
+                Ok(d) => d,
+                Err(Error::UsingWaterfallsWithElip151) => {
+                    self.get_history(&descriptor, store).await?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            self.get_history(&descriptor, store).await?
+        };
 
+        let tip = self.tip().await?;
+
+        let history_txs_id: HashSet<Txid> = txid_height.keys().cloned().collect();
+        let new_txs = self
+            .download_txs(&history_txs_id, &scripts, store, &descriptor)
+            .await?;
+        let history_txs_heights_plus_tip: HashSet<Height> = txid_height
+            .values()
+            .filter_map(|e| *e)
+            .chain(std::iter::once(tip.height))
+            .collect();
+        let timestamps = self
+            .download_headers(
+                &history_txs_heights_plus_tip,
+                &height_blockhash,
+                &height_timestamp,
+                store,
+            )
+            .await?;
+
+        let store_last_unused_external = store
+            .cache
+            .last_unused_external
+            .load(atomic::Ordering::Relaxed);
+        let store_last_unused_internal = store
+            .cache
+            .last_unused_internal
+            .load(atomic::Ordering::Relaxed);
+
+        let last_unused_changed = store_last_unused_external != last_unused.external
+            || store_last_unused_internal != last_unused.internal;
+
+        let changed = !new_txs.txs.is_empty()
+            || last_unused_changed
+            || !scripts.is_empty()
+            || !timestamps.is_empty()
+            || store.cache.tip != (tip.height, tip.block_hash());
+
+        if changed {
+            log::debug!("something changed: !new_txs.txs.is_empty():{} last_unused_changed:{} !scripts.is_empty():{} !timestamps.is_empty():{}", !new_txs.txs.is_empty(), last_unused_changed, !scripts.is_empty(), !timestamps.is_empty() );
+
+            let txid_height_new: Vec<_> = txid_height
+                .iter()
+                .filter(|(k, v)| match store.cache.heights.get(*k) {
+                    Some(e) => e != *v,
+                    None => true,
+                })
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let txid_height_delete: Vec<_> = store
+                .cache
+                .heights
+                .keys()
+                .filter(|k| txid_height.get(*k).is_none())
+                .cloned()
+                .collect();
+            let wollet_status = wollet.status();
+
+            let update = Update {
+                wollet_status,
+                new_txs,
+                txid_height_new,
+                txid_height_delete,
+                timestamps,
+                scripts,
+                tip,
+            };
+            Ok(Some(update))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_history(
+        &mut self,
+        descriptor: &WolletDescriptor,
+        store: &Store,
+    ) -> Result<Data, Error> {
+        let mut data = Data::default();
         for descriptor in descriptor.descriptor().clone().into_single_descriptors()? {
             let mut batch_count = 0;
             let chain: Chain = (&descriptor).try_into().unwrap_or(Chain::External);
@@ -144,7 +268,7 @@ impl EsploraWasmClient {
                 let s: Vec<_> = batch.value.iter().map(|e| &e.0).collect();
                 let result: Vec<Vec<History>> = self.get_scripts_history(&s).await?;
                 if !batch.cached {
-                    scripts.extend(batch.value);
+                    data.scripts.extend(batch.value);
                 }
                 let max = result
                     .iter()
@@ -155,10 +279,10 @@ impl EsploraWasmClient {
                 if let Some(max) = max {
                     match chain {
                         Chain::External => {
-                            last_unused_external = 1 + max + batch_count * BATCH_SIZE
+                            data.last_unused.external = 1 + max + batch_count * BATCH_SIZE
                         }
                         Chain::Internal => {
-                            last_unused_internal = 1 + max + batch_count * BATCH_SIZE
+                            data.last_unused.internal = 1 + max + batch_count * BATCH_SIZE
                         }
                     }
                 };
@@ -176,11 +300,11 @@ impl EsploraWasmClient {
                     let height = el.height.max(0);
                     let txid = el.txid;
                     if height == 0 {
-                        txid_height.insert(txid, None);
+                        data.txid_height.insert(txid, None);
                     } else {
-                        txid_height.insert(txid, Some(height as u32));
+                        data.txid_height.insert(txid, Some(height as u32));
                         if let Some(block_hash) = el.block_hash {
-                            height_blockhash.insert(height as u32, block_hash);
+                            data.height_blockhash.insert(height as u32, block_hash);
                         }
                     }
                 }
@@ -188,71 +312,109 @@ impl EsploraWasmClient {
                 batch_count += 1;
             }
         }
+        Ok(data)
+    }
 
-        let tip = self.tip().await?;
-
-        let history_txs_id: HashSet<Txid> = txid_height.keys().cloned().collect();
-        let new_txs = self
-            .download_txs(&history_txs_id, &scripts, store, &descriptor)
-            .await?;
-        let history_txs_heights_plus_tip: HashSet<Height> = txid_height
-            .values()
-            .filter_map(|e| *e)
-            .chain(std::iter::once(tip.height))
-            .collect();
-        let timestamps = self
-            .download_headers(&history_txs_heights_plus_tip, &height_blockhash, store)
-            .await?;
-
-        let store_last_unused_external = store
-            .cache
-            .last_unused_external
-            .load(atomic::Ordering::Relaxed);
-        let store_last_unused_internal = store
-            .cache
-            .last_unused_internal
-            .load(atomic::Ordering::Relaxed);
-
-        let last_unused_changed = store_last_unused_external != last_unused_external
-            || store_last_unused_internal != last_unused_internal;
-
-        let changed = !new_txs.txs.is_empty()
-            || last_unused_changed
-            || !scripts.is_empty()
-            || !timestamps.is_empty()
-            || store.cache.tip != (tip.height, tip.block_hash());
-
-        if changed {
-            tracing::debug!("something changed: !new_txs.txs.is_empty():{} last_unused_changed:{} !scripts.is_empty():{} !timestamps.is_empty():{}", !new_txs.txs.is_empty(), last_unused_changed, !scripts.is_empty(), !timestamps.is_empty() );
-
-            let txid_height_new: Vec<_> = txid_height
-                .iter()
-                .filter(|(k, v)| match store.cache.heights.get(*k) {
-                    Some(e) => e != *v,
-                    None => true,
-                })
-                .map(|(k, v)| (*k, *v))
-                .collect();
-            let txid_height_delete: Vec<_> = store
-                .cache
-                .heights
-                .keys()
-                .filter(|k| txid_height.get(*k).is_none())
-                .cloned()
-                .collect();
-
-            let update = Update {
-                new_txs,
-                txid_height_new,
-                txid_height_delete,
-                timestamps,
-                scripts,
-                tip,
-            };
-            Ok(Some(update))
-        } else {
-            Ok(None)
+    /// Returns the waterfall server recipient key using a cached value or by asking the server its key
+    async fn waterfalls_server_recipient(&mut self) -> Result<Recipient, Error> {
+        match self.waterfalls_server_recipient.as_ref() {
+            Some(r) => Ok(r.clone()),
+            None => {
+                let url = format!("{}/v1/server_recipient", self.base_url);
+                let response = self.client.get(&url).send().await?;
+                let status = response.status().as_u16();
+                let body = response.text().await?;
+                if status != 200 {
+                    return Err(Error::Generic(body));
+                }
+                let rec = Recipient::from_str(&body).map_err(|_| Error::CannotParseRecipientKey)?;
+                self.waterfalls_server_recipient = Some(rec.clone());
+                Ok(rec)
+            }
         }
+    }
+
+    async fn get_history_waterfalls(
+        &mut self,
+        descriptor: &WolletDescriptor,
+        store: &Store,
+    ) -> Result<Data, Error> {
+        let descriptor_url = format!("{}/v1/waterfalls", self.base_url);
+        if descriptor.is_elip151() {
+            return Err(Error::UsingWaterfallsWithElip151);
+        }
+        let desc = descriptor.bitcoin_descriptor_without_key_origin();
+        let desc = if self.waterfalls_avoid_encryption {
+            desc
+        } else {
+            let recipient = self.waterfalls_server_recipient().await?;
+
+            // TODO ideally the encrypted descriptor should be cached and reused, so that caching can be leveraged
+            encrypt(&desc, recipient)?
+        };
+
+        let response = self
+            .client
+            .get(&descriptor_url)
+            .query(&[("descriptor", desc)])
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+
+        if status != 200 {
+            return Err(Error::Generic(body));
+        }
+
+        let waterfalls_result: WaterfallsResult = serde_json::from_str(&body)?;
+        let mut data = Data::default();
+
+        for (desc, chain_history) in waterfalls_result.txs_seen.iter() {
+            let desc: elements_miniscript::Descriptor<DescriptorPublicKey> = desc.parse()?;
+            let chain: Chain = (&desc)
+                .try_into()
+                .map_err(|_| Error::Generic("Cannot determine chain from desc".into()))?;
+            let max = chain_history
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(i, _)| i as u32)
+                .max();
+            if let Some(max) = max {
+                data.last_unused[chain] = max + 1;
+            }
+            for (i, script_history) in chain_history.iter().enumerate() {
+                // TODO handle paging by asking following pages if there are more than 1000 results
+                let child = ChildNumber::from(waterfalls_result.page as u32 * 1000 + i as u32);
+                let (script, cached) = store.get_or_derive(chain, child, &desc)?;
+                if !cached {
+                    data.scripts.insert(script, (chain, child));
+                }
+                for tx_seen in script_history {
+                    let height = if tx_seen.height > 0 {
+                        Some(tx_seen.height as u32)
+                    } else {
+                        None
+                    };
+                    if let Some(height) = height.as_ref() {
+                        if let Some(block_hash) = tx_seen.block_hash.as_ref() {
+                            data.height_blockhash.insert(*height, *block_hash);
+                        }
+                        if let Some(ts) = tx_seen.block_timestamp.as_ref() {
+                            data.height_timestamp.insert(*height, *ts);
+                        }
+                    }
+
+                    data.txid_height.insert(tx_seen.txid, height);
+                }
+            }
+        }
+
+        Ok(data)
+    }
+
+    pub fn avoid_encryption(&mut self) {
+        self.waterfalls_avoid_encryption = true;
     }
 
     async fn download_txs(
@@ -267,63 +429,48 @@ impl EsploraWasmClient {
 
         let mut txs_in_db = store.cache.all_txs.keys().cloned().collect();
         let txs_to_download: Vec<Txid> = history_txs_id.difference(&txs_in_db).cloned().collect();
-        if !txs_to_download.is_empty() {
-            let txs_downloaded = self.get_transactions(&txs_to_download).await?;
 
-            let previous_txs_to_download = HashSet::new();
-            for tx in txs_downloaded.into_iter() {
-                let txid = tx.txid();
-                txs_in_db.insert(txid);
+        for txid in txs_to_download {
+            let tx = self.get_transaction(txid).await?;
 
-                for (i, output) in tx.output.iter().enumerate() {
-                    // could be the searched script it's not yet in the store, because created in the current run, thus it's searched also in the `scripts`
-                    if store.cache.paths.contains_key(&output.script_pubkey)
-                        || scripts.contains_key(&output.script_pubkey)
-                    {
-                        let vout = i as u32;
-                        let outpoint = OutPoint {
-                            txid: tx.txid(),
-                            vout,
-                        };
+            txs_in_db.insert(txid);
 
-                        match try_unblind(output.clone(), descriptor) {
+            for (i, output) in tx.output.iter().enumerate() {
+                // could be the searched script it's not yet in the store, because created in the current run, thus it's searched also in the `scripts`
+                if store.cache.paths.contains_key(&output.script_pubkey)
+                    || scripts.contains_key(&output.script_pubkey)
+                {
+                    let vout = i as u32;
+                    let outpoint = OutPoint { txid, vout };
+
+                    match try_unblind(output.clone(), descriptor) {
                             Ok(unblinded) => unblinds.push((outpoint, unblinded)),
-                            Err(_) => tracing::info!("{} cannot unblind, ignoring (could be sender messed up with the blinding process)", outpoint),
+                            Err(_) => log::info!("{} cannot unblind, ignoring (could be sender messed up with the blinding process)", outpoint),
                         }
-                    }
-                }
-
-                // FIXME: If no output is unblinded we should ignore this transaction,
-                // also we should not insert this in `heights`.
-                txs.push((txid, tx));
-            }
-
-            let txs_to_download: Vec<Txid> = previous_txs_to_download
-                .difference(&txs_in_db)
-                .cloned()
-                .collect();
-            if !txs_to_download.is_empty() {
-                for tx in self.get_transactions(&txs_to_download).await? {
-                    txs.push((tx.txid(), tx));
                 }
             }
-            Ok(DownloadTxResult { txs, unblinds })
-        } else {
-            Ok(DownloadTxResult::default())
+
+            txs.push((txid, tx));
         }
+
+        Ok(DownloadTxResult { txs, unblinds })
     }
 
     async fn download_headers(
         &self,
         history_txs_heights_plus_tip: &HashSet<Height>,
         height_blockhash: &HashMap<Height, BlockHash>,
+        height_timestamp: &HashMap<Height, Timestamp>,
         store: &Store,
     ) -> Result<Vec<(Height, Timestamp)>, Error> {
         let mut result = vec![];
-        let heights_in_db: HashSet<Height> =
-            store.cache.heights.iter().filter_map(|(_, h)| *h).collect();
+        let heights_in_db: HashSet<Height> = store.cache.timestamps.keys().cloned().collect();
+        let heights_in_response: HashSet<Height> = height_timestamp.keys().cloned().collect();
+        let heights_in_both: HashSet<Height> =
+            heights_in_db.union(&heights_in_response).cloned().collect();
+
         let heights_to_download: Vec<Height> = history_txs_heights_plus_tip
-            .difference(&heights_in_db)
+            .difference(&heights_in_both)
             .cloned()
             .collect();
         if !heights_to_download.is_empty() {
@@ -334,19 +481,32 @@ impl EsploraWasmClient {
                 result.push((h.height, h.time))
             }
 
-            tracing::debug!("{} headers_downloaded", heights_to_download.len());
+            log::debug!("{} headers_downloaded", heights_to_download.len());
         }
+
+        let heights_to_insert = height_timestamp
+            .iter()
+            .filter(|e| !heights_in_db.contains(e.0))
+            .map(|(h, t)| (*h, *t));
+        result.extend(heights_to_insert);
 
         Ok(result)
     }
 }
 
-async fn get_with_retry(url: &str) -> Result<Response, Error> {
+async fn get_with_retry(client: &reqwest::Client, url: &str) -> Result<Response, Error> {
     let mut attempt = 0;
     loop {
-        let response = reqwest::get(url).await?;
-        tracing::debug!(
-            "{} status_code:{} body bytes:{:?}",
+        let response = client.get(url).send().await?;
+
+        let level = if response.status() == 200 {
+            log::Level::Trace
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            level,
+            "{} status_code:{} - body bytes:{:?}",
             &url,
             response.status(),
             response.content_length(),
@@ -356,11 +516,12 @@ async fn get_with_retry(url: &str) -> Result<Response, Error> {
         // 503 Service Temporarily Unavailable
         if response.status() == 429 || response.status() == 503 {
             if attempt > 6 {
+                log::warn!("{url} tried 6 times, failing");
                 return Err(Error::Generic("Too many retry".to_string()));
             }
             let secs = 1 << attempt;
 
-            tracing::debug!("waiting {secs}");
+            log::debug!("{url} waiting {secs}");
 
             async_sleep(secs * 1000).await;
             attempt += 1;
@@ -394,6 +555,7 @@ impl From<EsploraTx> for History {
             txid: value.txid,
             height: value.status.block_height.unwrap_or(-1),
             block_hash: value.status.block_hash,
+            block_timestamp: None,
         }
     }
 }
@@ -416,19 +578,22 @@ struct Status {
 mod tests {
     use std::collections::HashMap;
 
+    use crate::ElementsNetwork;
+
     use super::EsploraWasmClient;
     use elements::{encode::Decodable, BlockHash};
 
     async fn get_block(base_url: &str, hash: BlockHash) -> elements::Block {
         let url = format!("{}/block/{}/raw", base_url, hash);
-        let response = super::get_with_retry(&url).await.unwrap();
+        let client = reqwest::Client::new();
+        let response = super::get_with_retry(&client, &url).await.unwrap();
         elements::Block::consensus_decode(&response.bytes().await.unwrap()[..]).unwrap()
     }
 
     #[ignore = "Should be integration test, but it is testing private function"]
     #[tokio::test]
     async fn esplora_wasm_local() {
-        let server = lwk_test_util::setup(true);
+        let server = lwk_test_util::setup_with_esplora();
 
         let esplora_url = format!("http://{}", server.electrs.esplora_url.as_ref().unwrap());
         test_esplora_url(&esplora_url).await;
@@ -448,9 +613,14 @@ mod tests {
     }
 
     async fn test_esplora_url(esplora_url: &str) {
-        println!("{}", esplora_url);
-
-        let mut client = EsploraWasmClient::new(esplora_url);
+        let network = if esplora_url.contains("liquidtestnet") {
+            ElementsNetwork::LiquidTestnet
+        } else if esplora_url.contains("liquid") {
+            ElementsNetwork::Liquid
+        } else {
+            ElementsNetwork::default_regtest()
+        };
+        let mut client = EsploraWasmClient::new(network, esplora_url, false);
         let header = client.tip().await.unwrap();
         assert!(header.height > 100);
 
@@ -462,9 +632,9 @@ mod tests {
         let genesis_tx = &genesis_block.txdata[0];
 
         let txid = genesis_tx.txid();
-        let txs = client.get_transactions(&[txid]).await.unwrap();
+        let tx = client.get_transaction(txid).await.unwrap();
 
-        assert_eq!(txs[0].txid(), txid);
+        assert_eq!(tx.txid(), txid);
 
         let existing_script = &genesis_tx.output[0].script_pubkey;
 

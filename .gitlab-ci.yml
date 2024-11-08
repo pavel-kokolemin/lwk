@@ -5,7 +5,7 @@ variables:
   DOCKER_TLS_CERTDIR: ""
 
 .base:
-  image: xenoky/lwk-builder@sha256:5468d3679a1cd2a1ca174ca7792cef62e11dbcedd14fad3e9e937e865e981aee
+  image: xenoky/lwk-builder@sha256:7e0efea7ca92359011eb91f38ddccff7ecb3eba4398e05482133cfadc8e9d5d2
   tags:
     - cloud
   retry:
@@ -49,7 +49,7 @@ test_jade:
 test_ledger:
   extends: .base
   script:
-    - cargo test -p lwk_ledger
+    - cargo test -p lwk_ledger --features asyncr
 
 test_serial:
   extends: .base
@@ -117,8 +117,7 @@ build_cli:
 audit:
   extends: .base
   script:
-    # ignore unmantained serde_cbor
-    - cargo audit -D warnings --ignore RUSTSEC-2021-0127
+    - cargo audit
 
 doc:
   extends: .base
@@ -139,6 +138,28 @@ bindings:
     - cp ./context/env.sh / && cd / && . ./env.sh && cd -
     - cargo test -p lwk_bindings --features foreign_bindings
 
+csharp:
+  extends: .base
+  script:
+    - cargo build --release -p lwk_bindings
+    - mkdir csharp
+    - cp target/release/liblwk.so csharp/
+    - uniffi-bindgen-cs --library csharp/liblwk.so --out-dir csharp
+    - sed -i 's#\"lwk\"#\"./liblwk.so\"#g' csharp/lwk.cs # this is an hack, but make it work until we understand how to properly reference the dynamic lib
+    - cp lwk_bindings/tests/bindings/list_transactions.cs csharp
+    - cp lwk_bindings/tests/test_data/test-dotnet.csproj csharp
+    - cd csharp && dotnet run && cd -
+    - rm -rf csharp/bin && rm -rf csharp/obj # remove dotnet-build created files
+  artifacts:
+    paths:
+      - csharp
+
+just:
+  extends: .base
+  script:
+    - just python-test-bindings
+    - just kotlin # kotlin-android would require cargo-ndk and various targets, tested on github which produce the kotlin package
+
 wasm:
   extends: .base
   variables:
@@ -149,14 +170,19 @@ wasm:
     - cargo check --target wasm32-unknown-unknown -p lwk_wollet --no-default-features --features esplora_wasm,serial
     - cargo check --target wasm32-unknown-unknown -p lwk_signer --no-default-features
     - cargo check --target wasm32-unknown-unknown -p lwk_jade --no-default-features --features asyncr --features serial
-    - cd lwk_wasm && WASM_BINDGEN_TEST_TIMEOUT=60 wasm-pack test --chrome --headless --features serial
+    - cargo check --target wasm32-unknown-unknown -p lwk_ledger --no-default-features
+    - cd lwk_wasm && WASM_BINDGEN_TEST_TIMEOUT=60 wasm-pack test --chrome --headless --features serial && cd -
+    - cd lwk_wasm && RUSTFLAGS="--cfg=web_sys_unstable_apis" CARGO_PROFILE_RELEASE_OPT_LEVEL=z wasm-pack build --features serial && cd -
+  artifacts:
+    paths:
+      - lwk_wasm/pkg
 
 linux-wheels:
   image:
     name: ghcr.io/pyo3/maturin
     entrypoint: [""]
   script:
-    - pip install uniffi-bindgen==0.26.1 # must be the same as in lwk_bindings/Cargo.toml
+    - pip install uniffi-bindgen==0.28.0 # major version must be the same as in lwk_bindings/Cargo.toml
     - maturin build --release -m lwk_bindings/Cargo.toml -b uniffi
   artifacts:
     paths:
@@ -170,3 +196,5 @@ nix:
   script:
     - nix $EXP_FEAT $CACHE build .
     - nix $EXP_FEAT $CACHE develop . -c cargo test -p lwk_cli --features registry -- registry_publish
+    - nix $EXP_FEAT $CACHE develop . -c rust-analyzer analysis-stats . 2>log # prints ERROR if there are cyclic deps with dev-deps
+    - (! grep ERROR log)

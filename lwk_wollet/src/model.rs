@@ -4,6 +4,7 @@ use crate::pset_create::validate_address;
 use crate::secp256k1::PublicKey;
 use crate::store::Timestamp;
 use crate::{ElementsNetwork, Error};
+use elements::bitcoin;
 use lwk_common::burn_script;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 
 /// Details of a wallet transaction output used in [`WalletTx`]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WalletTxOut {
     pub outpoint: OutPoint,
     pub script_pubkey: Script,
@@ -21,9 +22,26 @@ pub struct WalletTxOut {
     pub ext_int: Chain,
 }
 
+/// A UTXO owned by another wallet
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExternalUtxo {
+    /// The outpoint of the UTXO
+    pub outpoint: elements::OutPoint,
+
+    /// The transaction output
+    pub txout: elements::TxOut,
+
+    /// The unblinded values
+    pub unblinded: elements::TxOutSecrets,
+
+    /// Max weight to satisfy
+    pub max_weight_to_satisfy: usize,
+}
+
 /// Value returned by [`crate::Wollet::transactions()`] containing details about a transaction
-/// from the perspective of the wallet, for example the net-balance of the wallet.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// from the perspective of the wallet, for example the net-balance of the transaction for the
+/// wallet.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WalletTx {
     pub tx: Transaction,
     pub txid: Txid,
@@ -168,6 +186,31 @@ impl AddressResult {
 
     pub fn index(&self) -> u32 {
         self.index
+    }
+}
+
+/// Value returned from [`crate::Wollet::pegin_address()`], containing the bitcoin address
+/// and the derivation index used to derive the elements script pubkey used to create the commit for the pegin address
+#[derive(Debug, Clone)]
+pub struct BitcoinAddressResult {
+    address: bitcoin::Address,
+    tweak_index: u32,
+}
+
+impl BitcoinAddressResult {
+    pub fn new(address: bitcoin::Address, index: u32) -> Self {
+        Self {
+            address,
+            tweak_index: index,
+        }
+    }
+
+    pub fn address(&self) -> &bitcoin::Address {
+        &self.address
+    }
+
+    pub fn tweak_index(&self) -> u32 {
+        self.tweak_index
     }
 }
 

@@ -28,6 +28,14 @@ pub enum Error {
     #[error(transparent)]
     ClientError(#[from] electrum_client::Error),
 
+    #[cfg(feature = "elements_rpc")]
+    #[error(transparent)]
+    ElementsRpcError(#[from] bitcoincore_rpc::Error),
+
+    #[cfg(feature = "elements_rpc")]
+    #[error("Elements RPC returned an unexpected value for call {0}")]
+    ElementsRpcUnexpectedReturn(String),
+
     #[error(transparent)]
     ElementsEncode(#[from] crate::elements::encode::Error),
 
@@ -154,8 +162,30 @@ pub enum Error {
         store_tip_height: u32,
     },
 
+    #[error("Update created on a wallet with status {update_status} while current wallet has {wollet_status}")]
+    UpdateOnDifferentStatus {
+        wollet_status: u64,
+        update_status: u64,
+    },
+
     #[error("An issuance has already being set on this tx builder")]
     IssuanceAlreadySet,
+
+    #[error("Blockchain backend have not implemented waterfalls method")]
+    WaterfallsUnimplemented,
+
+    #[error("Cannot use waterfalls scan with elip151 because it would reveal the blinding key to the server")]
+    UsingWaterfallsWithElip151,
+
+    #[error("Cannot encrypt")]
+    CannotEncrypt,
+
+    #[error("Cannot parse server recipient key")]
+    CannotParseRecipientKey,
+
+    #[cfg(feature = "electrum")]
+    #[error(transparent)]
+    Url(#[from] crate::clients::electrum_client::UrlError),
 }
 
 // cannot derive automatically with this error because of trait bound

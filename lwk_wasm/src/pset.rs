@@ -1,5 +1,5 @@
-use crate::{AssetId, Error, Transaction};
-use lwk_wollet::elements::pset::PartiallySignedTransaction;
+use crate::{AssetId, Error, Transaction, Txid};
+use lwk_wollet::elements::pset::{Input, PartiallySignedTransaction};
 use std::fmt::Display;
 use wasm_bindgen::prelude::*;
 
@@ -48,21 +48,56 @@ impl Pset {
         Ok(tx)
     }
 
-    #[wasm_bindgen(js_name = issuanceAsset)]
-    pub fn issuance_asset(&self, index: u32) -> Option<AssetId> {
-        self.issuances_ids(index).map(|e| e.0)
+    pub fn combine(&mut self, other: Pset) -> Result<(), Error> {
+        self.inner.merge(other.into())?;
+        Ok(())
     }
 
-    #[wasm_bindgen(js_name = issuanceToken)]
-    pub fn issuance_token(&self, index: u32) -> Option<AssetId> {
-        self.issuances_ids(index).map(|e| e.1)
+    pub fn inputs(&self) -> Vec<PsetInput> {
+        self.inner.inputs().iter().map(Into::into).collect()
     }
 }
 
-impl Pset {
-    fn issuances_ids(&self, index: u32) -> Option<(AssetId, AssetId)> {
-        let issuance_ids = self.inner.inputs().get(index as usize)?.issuance_ids();
-        Some((issuance_ids.0.into(), issuance_ids.1.into()))
+/// PSET input
+#[wasm_bindgen]
+pub struct PsetInput {
+    inner: Input,
+}
+
+impl From<&Input> for PsetInput {
+    fn from(inner: &Input) -> Self {
+        Self {
+            inner: inner.clone(),
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl PsetInput {
+    /// Prevout TXID of the input
+    pub fn previous_txid(&self) -> Txid {
+        self.inner.previous_txid.into()
+    }
+
+    /// Prevout vout of the input
+    pub fn previous_vout(&self) -> u32 {
+        self.inner.previous_output_index
+    }
+
+    /// If the input has an issuance, the asset id
+    #[wasm_bindgen(js_name = issuanceAsset)]
+    pub fn issuance_asset(&self) -> Option<AssetId> {
+        self.inner
+            .has_issuance()
+            .then(|| self.inner.issuance_ids().0.into())
+    }
+
+    /// If the input has an issuance, the token id
+    #[wasm_bindgen(js_name = issuanceToken)]
+    pub fn issuance_token(&self) -> Option<AssetId> {
+        self.inner
+            .has_issuance()
+            .then(|| self.inner.issuance_ids().1.into())
     }
 }
 
@@ -85,5 +120,15 @@ mod tests {
         assert_eq!(tx_expected, tx_string);
 
         assert_eq!(pset_string, pset.to_string());
+
+        let pset_in = &pset.inputs()[0];
+        assert_eq!(
+            pset_in.previous_txid().to_string(),
+            "0093c96a69e9ea00b5409611f23435b6639c157afa1c88cf18960715ea10116c"
+        );
+        assert_eq!(pset_in.previous_vout(), 0);
+
+        assert!(pset_in.issuance_asset().is_none());
+        assert!(pset_in.issuance_token().is_none());
     }
 }

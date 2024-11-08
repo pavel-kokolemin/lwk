@@ -11,6 +11,9 @@ use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 /// A Liquid transaction, wrapper of [`elements::Transaction`]
+///
+/// See [`crate::WalletTx`] for the transaction as seen from the perspective of the wallet
+/// where you can actually see unblinded amounts and tx net-balance.
 #[wasm_bindgen]
 #[derive(PartialEq, Eq, Debug, Hash, Clone)]
 pub struct Transaction {
@@ -113,11 +116,11 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_tx_id() {
-        let expected = "HexToArray(InvalidLength(64, 2))";
+        let expected = "HexToArray(InvalidLength(InvalidLengthError { expected: 64, invalid: 2 }))";
         let hex = "xx";
         assert_eq!(expected, format!("{:?}", Txid::new(hex).unwrap_err()));
 
-        let expected = "HexToArray(Conversion(InvalidChar(120)))";
+        let expected = "HexToArray(InvalidChar(InvalidCharError { invalid: 120 }))";
         let hex = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         assert_eq!(expected, format!("{:?}", Txid::new(hex).unwrap_err()));
 
@@ -127,7 +130,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn test_transaction() {
-        let expected = "HexToBytes(InvalidChar(120))";
+        let expected = "HexToBytes(InvalidChar(InvalidCharError { invalid: 120 }))";
         let hex = "xx";
         assert_eq!(
             expected,

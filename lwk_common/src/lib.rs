@@ -13,7 +13,9 @@ mod descriptor;
 mod error;
 mod keyorigin_xpub;
 mod model;
+pub mod precision;
 mod qr;
+mod segwit;
 mod signer;
 
 pub use crate::descriptor::{
@@ -24,7 +26,9 @@ pub use crate::descriptor::{
 pub use crate::error::Error;
 pub use crate::keyorigin_xpub::{keyorigin_xpub_from_str, InvalidKeyOriginXpub};
 pub use crate::model::*;
+pub use crate::precision::Precision;
 pub use crate::qr::*;
+pub use crate::segwit::is_provably_segwit;
 pub use crate::signer::Signer;
 
 use elements::confidential::{Asset, Value};
@@ -42,6 +46,11 @@ use elements_miniscript::elements::{
 };
 use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
 use std::collections::btree_map::BTreeMap;
+
+pub mod electrum_ssl {
+    pub const LIQUID_SOCKET: &str = "elements-mainnet.blockstream.info:50002";
+    pub const LIQUID_TESTNET_SOCKET: &str = "elements-testnet.blockstream.info:50002";
+}
 
 pub fn derive_script_pubkey(
     descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,

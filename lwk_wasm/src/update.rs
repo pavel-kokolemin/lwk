@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
 
-use crate::{Error, WolletDescriptor};
+use crate::{Error, Wollet, WolletDescriptor};
 
 /// Wrapper of [`lwk_wollet::Update`]
 #[wasm_bindgen]
@@ -62,6 +62,10 @@ impl Update {
     pub fn only_tip(&self) -> bool {
         self.inner.only_tip()
     }
+
+    pub fn prune(&mut self, wollet: &Wollet) {
+        self.inner.prune(wollet.as_ref());
+    }
 }
 
 #[cfg(test)]
@@ -81,7 +85,7 @@ mod tests {
     fn test_update() {
         let bytes = update_test_vector_bytes();
         let update = crate::Update::new(&bytes).unwrap();
-        assert_eq!(update.serialize().unwrap(), bytes);
+        // assert_eq!(update.serialize().unwrap(), bytes); // not true anymore because test vector is v0, backward comp tested upstream anyway
         assert!(!update.only_tip());
 
         let base64 = include_str!("../test_data/update.base64");
